@@ -95,6 +95,8 @@ class FlacrGUI(tk.Tk):
         self.log_button.grid(row=0, column=1, padx=5, sticky='w')
         self.help_button = tk.Button(btn_frame, text='Help', command=self.show_help)
         self.help_button.grid(row=0, column=2, padx=5, sticky='w')
+        self.copy_cmd_button = tk.Button(btn_frame, text='Copy CLI Command', command=self.copy_cli_command)
+        self.copy_cmd_button.grid(row=0, column=3, padx=5, sticky='w')
 
         # Output box with tag for error highlighting
         self.output_text = tk.Text(self, height=15, width=80, state='disabled', wrap='word')
@@ -115,6 +117,13 @@ class FlacrGUI(tk.Tk):
     def run_flacr(self):
         if not self.check_dependencies():
             return
+        if self.p_var.get() and not self.tqdm_installed():
+            if not messagebox.askyesno('tqdm not installed', 'tqdm is required for progress bars. Continue anyway?'):
+                return
+        if (self.j_var.get() or self.S_var.get()):
+            if not self.flac_supports_threads():
+                messagebox.showwarning('flac version too old', 'flac >=1.5.0 is required for multi-threaded encoding (-j/-S).')
+                return
         self.save_settings()
         self.run_button.config(state='disabled')
         self.output_text.config(state='normal')
@@ -124,6 +133,27 @@ class FlacrGUI(tk.Tk):
         self.progress['value'] = 0
         args = self.build_args()
         threading.Thread(target=self._run_flacr_thread, args=(args,), daemon=True).start()
+
+    def tqdm_installed(self):
+        try:
+            import tqdm
+            return True
+        except ImportError:
+            return False
+
+    def flac_supports_threads(self):
+        flac_path = shutil.which('flac')
+        if not flac_path:
+            return False
+        try:
+            out = subprocess.check_output([flac_path, '--version'], encoding='utf-8', stderr=subprocess.STDOUT)
+            m = re.search(r'flac (\d+)\.(\d+)\.(\d+)', out)
+            if m:
+                major, minor, patch = map(int, m.groups())
+                return (major > 1) or (major == 1 and minor >= 5)
+        except Exception:
+            return False
+        return False
 
     def build_args(self):
         args = [sys.executable, SCRIPT_PATH]
@@ -221,20 +251,42 @@ class FlacrGUI(tk.Tk):
             'flacr - FLAC Recompressor GUI\n\n'
             'Options:\n'
             '-d: Directory to scan for .flac files.\n'
-            '-j: Encode 1 file at a time with multi-threading.\n'
+            '-j: flac >=1.5.0: Encode 1 file at a time with multi-threading (threadcount via -m) instead of encoding multiple files concurrently.\n'
             '-l: Log errors to flacr.log.\n'
-            '-m: Number of threads for conversion.\n'
-            '-p: Show progress bars.\n'
-            '-r: Calculate replay gain.\n'
+            '-m: Number of threads for conversion and replay gain calculation.\n'
+            '-p: Show progress bars (requires tqdm).\n'
+            '-r: Calculate replay gain (requires rsgain).\n'
             '-s: Only scan the current folder.\n'
             '-t: Test only, skip recompression.\n'
-            '-Q: Quick mode.\n'
-            '-S: Sequential mode.\n\n'
+            '-Q: Quick mode: -r -p and -m with all available threads.\n'
+            '-S: Sequential mode: -j -r -p and -m 4.\n\n'
+            'Common examples:\n'
+            'Test flac files for errors (4 threads):\n'
+            '  flacr.py -t -m 4\n'
+            'Recompress flac files, no replay gain (4 threads):\n'
+            '  flacr.py -m 4\n'
+            'Recompress and calculate replay gain (all threads, progress):\n'
+            '  flacr.py -Q\n'
+            'Sequential mode (4 threads, progress):\n'
+            '  flacr.py -S\n'
+            'With directory:\n'
+            '  flacr.py -rlp -m 4 -d "D:/Test"\n\n'
             'Documentation:\n'
+            'https://github.com/AverageHoarder/flacr\n'
             'https://github.com/complexlogic/rsgain/releases\n'
             'https://xiph.org/flac/download.html\n'
+            'https://github.com/tqdm/tqdm\n'
         )
         messagebox.showinfo('Help', help_text)
+
+    def copy_cli_command(self):
+        args = self.build_args()
+        # Remove sys.executable and script path for CLI copy
+        cli_args = args[2:] if args[0].endswith('python.exe') else args[1:]
+        cmd = f'python flacr.py {" ".join(map(str, cli_args))}'
+        self.clipboard_clear()
+        self.clipboard_append(cmd)
+        messagebox.showinfo('CLI Command', f'Copied to clipboard:\n{cmd}')
 
     def update_option_states(self):
         # Quick mode: -Q sets -m to max, -r, -p, disables -S
