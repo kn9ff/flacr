@@ -17,6 +17,13 @@ class FlacrGUI(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title('flacr - FLAC Recompressor GUI')
+        # Set application icon if available
+        icon_path = os.path.join(os.path.dirname(__file__), 'flaccheck.ico')
+        if os.path.exists(icon_path):
+            try:
+                self.iconbitmap(icon_path)
+            except Exception:
+                pass
         self.geometry('700x650')
         self.minsize(600, 500)
         self.create_widgets()

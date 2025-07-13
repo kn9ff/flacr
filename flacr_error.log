@@ -171,3 +171,12 @@ D:\Musik\Mucke unsortiert\#tmpzumsortieren\#2024\Amnesia - Hysteria (Defcon Mix)
 Amnesia - Hysteria (Defcon Mix) [1988].flac: ERROR got FLAC__STREAM_DECODER_ERROR_STATUS_LOST_SYNC while decoding FLAC input
 Amnesia - Hysteria (Defcon Mix) [1988].flac: ERROR: while decoding FLAC input, state = FLAC__STREAM_DECODER_END_OF_STREAM
 
+
+flacr error log, date: 2025-07-13 15:03:39
+D:\Musik\Mucke unsortiert\#tmpzumsortieren\#2024\Amnesia - Hysteria (Defcon Mix) [1988].flac
+Amnesia - Hysteria (Defcon Mix) [1988].flac: ERROR got FLAC__STREAM_DECODER_ERROR_STATUS_LOST_SYNC while decoding FLAC input
+Amnesia - Hysteria (Defcon Mix) [1988].flac: ERROR: while decoding FLAC input, state = FLAC__STREAM_DECODER_END_OF_STREAM
+
+D:\Musik\Mucke unsortiert\#tmpzumsortieren\#2024\01 - 24 Hours.flac
+01 - 24 Hours.flac: ERROR: 2 consecutive FLAC__STREAM_DECODER_END_OF_STREAM events.
+
