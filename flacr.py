@@ -223,10 +223,15 @@ def verify_flac(file_path):
             stderr=subprocess.PIPE,
             text=True,
             check=True,
+            timeout=600  # 10 minute timeout for verification
         )
         return file_path, result.stderr
+    except subprocess.TimeoutExpired:
+        return file_path, f"Verification timeout (10 minutes exceeded) for file: {file_path}"
     except subprocess.CalledProcessError as e:
         return file_path, e.stderr
+    except Exception as e:
+        return file_path, f"Unexpected error during verification: {e}"
 
 
 def get_system_flac_version():
@@ -289,11 +294,15 @@ def get_file_flac_version(file_path):
             stderr=subprocess.PIPE,
             text=True,
             check=True,
+            timeout=30  # 30 second timeout for metadata reading
         )
         # Example output: "reference libFLAC 1.4.2 20221022"
         match = re.search(r"libFLAC (\d+)\.(\d+)\.(\d+)", result.stdout)
         if match:
             return tuple(map(int, match.groups()))
+        return None
+    except subprocess.TimeoutExpired:
+        safe_print(f"Timeout reading metadata from {file_path}")
         return None
     except Exception:
         return None
@@ -311,8 +320,12 @@ def get_file_encoder_string(file_path):
             stderr=subprocess.PIPE,
             text=True,
             check=True,
+            timeout=30  # 30 second timeout for metadata reading
         )
         return result.stdout.strip() if result.stdout.strip() else None
+    except subprocess.TimeoutExpired:
+        safe_print(f"Timeout reading encoder string from {file_path}")
+        return None
     except Exception:
         return None
 
@@ -411,26 +424,32 @@ def is_flac_1_5_or_newer(file_path):
     Returns True if the FLAC file was encoded with FLAC 1.5.0 or newer, else False.
     Also checks if the file's encoder version matches the system's flac version.
     """
-    file_version = get_file_flac_version(file_path)
-    if file_version is None:
+    try:
+        file_version = get_file_flac_version(file_path)
+        if file_version is None:
+            # If we can't determine the version, assume it needs re-encoding
+            safe_print(f"Cannot determine FLAC version for {file_path}, will re-encode.")
+            return False
+        
+        major, minor, patch = file_version
+        is_new_enough = (major > 1) or (major == 1 and minor >= 5)
+        
+        if is_new_enough:
+            # Check if file version matches system version
+            system_version = get_system_flac_version()
+            if system_version is not None:
+                if file_version == system_version:
+                    return True
+                else:
+                    # File was encoded with a different version, consider re-encoding
+                    safe_print(f"File {file_path} was encoded with libFLAC {'.'.join(map(str, file_version))}, "
+                              f"but system has libFLAC {'.'.join(map(str, system_version))}. Will re-encode for consistency.")
+                    return False
+        
+        return is_new_enough
+    except Exception as e:
+        safe_print(f"Error checking FLAC version for {file_path}: {e}. Will re-encode.")
         return False
-    
-    major, minor, patch = file_version
-    is_new_enough = (major > 1) or (major == 1 and minor >= 5)
-    
-    if is_new_enough:
-        # Check if file version matches system version
-        system_version = get_system_flac_version()
-        if system_version is not None:
-            if file_version == system_version:
-                return True
-            else:
-                # File was encoded with a different version, consider re-encoding
-                safe_print(f"File {file_path} was encoded with libFLAC {'.'.join(map(str, file_version))}, "
-                          f"but system has libFLAC {'.'.join(map(str, system_version))}. Will re-encode for consistency.")
-                return False
-    
-    return is_new_enough
 
 
 def reencode_flac(file_path, thread_count=1):
@@ -780,13 +799,28 @@ def main(args):
             return
     
     # Filter files that need re-encoding
+    safe_print(f"Checking which files need re-encoding...")
     files_to_reencode = []
-    for f in flac_files:
-        if not is_flac_1_5_or_newer(f):
-            files_to_reencode.append(f)
-        else:
-            safe_print(f"Skipping {f}: already encoded with FLAC 1.5.0 or newer.")
-
+    skipped_count = 0
+    
+    with tqdm(
+        total=len(flac_files),
+        desc="checking files",
+        unit=" files",
+        disable=not progress,
+        ncols=100,
+    ) as pbar:
+        for f in flac_files:
+            pbar.set_postfix({"current": os.path.basename(f)})
+            if not is_flac_1_5_or_newer(f):
+                files_to_reencode.append(f)
+                safe_print(f"Will re-encode: {f}")
+            else:
+                skipped_count += 1
+                safe_print(f"Skipping {f}: already encoded with FLAC 1.5.0 or newer.")
+            pbar.update(1)
+    
+    safe_print(f"File check complete: {len(files_to_reencode)} files need re-encoding, {skipped_count} files skipped.")
     flac_files = files_to_reencode
 
     if not flac_files and not calc_rsgain:
@@ -814,12 +848,17 @@ def main(args):
                 disable=not progress,
                 ncols=100,
             ) as pbar:
-                for flac_file in flac_files:
+                for i, flac_file in enumerate(flac_files):
+                    safe_print(f"Processing: {flac_file}")
+                    pbar.set_postfix({"current": os.path.basename(flac_file)})
                     filepath, stderr = reencode_flac(flac_file, thread_count)
                     if stderr:
                         error_log.append((filepath, stderr))
                         error_count += 1
-                        pbar.set_postfix({"errors": error_count})
+                        safe_print(f"Error processing {filepath}: {stderr}")
+                        pbar.set_postfix({"errors": error_count, "current": os.path.basename(flac_file)})
+                    else:
+                        safe_print(f"Successfully processed: {filepath}")
                     pbar.update(1)
         # Encode multiple files concurrently
         else:
@@ -841,11 +880,15 @@ def main(args):
                     ncols=100,
                 ) as pbar:
                     for future in concurrent.futures.as_completed(futures):
+                        original_filepath = futures[future]
                         filepath, stderr = future.result()
                         if stderr:
                             error_log.append((filepath, stderr))
                             error_count += 1
+                            safe_print(f"Error processing {filepath}: {stderr}")
                             pbar.set_postfix({"errors": error_count})
+                        else:
+                            safe_print(f"Successfully processed: {filepath}")
                         pbar.update(1)
     elif test_run and flac_files:
         safe_print(f"Testing {len(flac_files)} files...")
@@ -867,11 +910,15 @@ def main(args):
                 ncols=100,
             ) as pbar:
                 for future in concurrent.futures.as_completed(futures):
+                    original_filepath = futures[future]
                     filepath, stderr = future.result()
                     if stderr:
                         error_log.append((filepath, stderr))
                         error_count += 1
+                        safe_print(f"Verification error for {filepath}: {stderr}")
                         pbar.set_postfix({"errors": error_count})
+                    else:
+                        safe_print(f"Successfully verified: {filepath}")
                     pbar.update(1)
 
     # Handle error logging and reporting

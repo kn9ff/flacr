@@ -3,11 +3,13 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import threading
 import subprocess
+import signal
 import sys
 import os
 import shutil
 import configparser
 import re
+import time
 
 SCRIPT_PATH = os.path.join(os.path.dirname(__file__), 'flacr.py')
 CONFIG_PATH = os.path.join(os.path.expanduser('~'), '.flacr_gui.ini')
@@ -150,6 +152,7 @@ class FlacrGUI(tk.Tk):
         self.output_text.config(state='normal')
         self.output_text.delete(1.0, tk.END)
         self.output_text.insert(tk.END, 'Running flacr...\n', 'bold')
+        self.output_text.insert(tk.END, 'Note: Process will timeout after 10 minutes of no output, or 30 minutes of no file progress.\n', 'warn')
         self.output_text.config(state='disabled')
         self.progress['value'] = 0
         self.progress_label.config(text='Starting...')
@@ -159,10 +162,14 @@ class FlacrGUI(tk.Tk):
     def cancel_flacr(self):
         """Cancel the running flacr process"""
         if self.process and self.process.poll() is None:
-            self.process.terminate()
-            self.append_output('\n[CANCELLED BY USER]\n', tag='error')
-            self.run_button.config(state='normal')
-            self.cancel_button.config(state='disabled')
+            try:
+                self.append_output('\n[CANCELLED BY USER]\n', tag='error')
+                self._terminate_process_safely()
+            except Exception as e:
+                self.append_output(f'Error during cancellation: {e}\n', tag='error')
+            finally:
+                self.run_button.config(state='normal')
+                self.cancel_button.config(state='disabled')
 
     def tqdm_installed(self):
         try:
@@ -213,50 +220,183 @@ class FlacrGUI(tk.Tk):
 
     def _run_flacr_thread(self, args):
         try:
-            self.process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            # Use creationflags on Windows to prevent console window and handle process groups properly
+            creation_flags = 0
+            if sys.platform == "win32":
+                creation_flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+            
+            self.process = subprocess.Popen(
+                args, 
+                stdout=subprocess.PIPE, 
+                stderr=subprocess.STDOUT, 
+                text=True, 
+                bufsize=1,
+                creationflags=creation_flags
+            )
+            
             total_files = None
             processed = 0
             current_file = ''
-
-            for line in self.process.stdout:
-                # Check if process was cancelled
-                if self.process.poll() is not None:
-                    break
-                    
-                self.append_output(line)
-
-                # Extract total files from summary lines if not already set
-                if total_files is None:
-                    summary_match = re.search(r'(\d+) flac files', line)
-                    if summary_match:
-                        total_files = int(summary_match.group(1))
-                        self.progress['maximum'] = total_files
-
-                # Update progress based on processed files
-                file_line = re.search(r'(Processing|Verifying|Encoding|Checking):\s*(.+\.flac)', line, re.IGNORECASE)
-                if file_line:
-                    processed += 1
-                    current_file = file_line.group(2).strip()
-                    self.update_progress(processed, total_files or processed, current_file)
-
-            self.process.wait()
+            last_output_time = time.time()
+            last_progress_time = time.time()
             
-            if self.process.returncode == 0:
-                self.update_progress(total_files or processed, total_files or processed, current_file)
-                self.progress_label.config(text='Completed successfully')
-                self.append_output('Done.\n', tag='bold')
-            elif self.process.returncode == -15:  # SIGTERM (cancelled)
-                self.progress_label.config(text='Cancelled by user')
-            else:
-                self.progress_label.config(text=f'Failed with exit code {self.process.returncode}')
-                self.append_output(f'Process exited with code {self.process.returncode}.\n', tag='error')
+            # More reasonable timeouts for different operations
+            no_output_timeout = 600  # 10 minutes for no output at all
+            progress_timeout = 1800  # 30 minutes for no file progress
+            
+            # Read output line by line until process completes
+            while True:
+                try:
+                    # Check if process has finished
+                    if self.process.poll() is not None:
+                        break
+                    
+                    # Try to read a line (this can block on Windows)
+                    try:
+                        # Use a smaller buffer and non-blocking approach
+                        line = self.process.stdout.readline()
+                    except Exception as read_error:
+                        self.append_output(f'Error reading from subprocess: {read_error}\n', tag='error')
+                        time.sleep(0.5)
+                        continue
+                    
+                    current_time = time.time()
+                    
+                    if line:
+                        last_output_time = current_time
+                        self.append_output(line)
+                        
+                        # Extract total files from summary lines if not already set
+                        if total_files is None:
+                            summary_match = re.search(r'(\d+) flac files', line)
+                            if summary_match:
+                                total_files = int(summary_match.group(1))
+                                self.progress['maximum'] = total_files
+
+                        # Update progress based on processed files
+                        file_line = re.search(r'(Processing|Verifying|Encoding|Checking|Successfully):\s*(.+\.flac)', line, re.IGNORECASE)
+                        if file_line:
+                            processed += 1
+                            current_file = file_line.group(2).strip()
+                            last_progress_time = current_time
+                            self.update_progress(processed, total_files or processed, current_file)
+                        
+                        # Also detect when files are being skipped
+                        skip_line = re.search(r'(Skipping|already encoded).*?(.+\.flac)', line, re.IGNORECASE)
+                        if skip_line:
+                            current_file = skip_line.group(2).strip() if skip_line.group(2) else "unknown file"
+                            last_progress_time = current_time
+                            self.update_progress(processed, total_files or processed, current_file)
+                    else:
+                        # No output available, small delay to prevent busy waiting
+                        time.sleep(0.1)
+                        
+                        # Check for timeouts
+                        time_since_output = current_time - last_output_time
+                        time_since_progress = current_time - last_progress_time
+                        
+                        # If no output for a very long time, terminate
+                        if time_since_output > no_output_timeout:
+                            self.append_output(f'\n[TIMEOUT] No output for {no_output_timeout//60} minutes. Process appears hung.\n', tag='error')
+                            self.append_output(f'[TIMEOUT] Last file being processed: {current_file}\n', tag='error')
+                            self._terminate_process_safely()
+                            break
+                        
+                        # If no file progress for a long time, but still getting output, warn but continue
+                        elif time_since_progress > progress_timeout:
+                            self.append_output(f'\n[WARNING] No file progress for {progress_timeout//60} minutes on: {current_file}\n', tag='warn')
+                            self.append_output('[WARNING] File may be very large or corrupted. Continuing to wait...\n', tag='warn')
+                            last_progress_time = current_time  # Reset warning timer
+                        
+                except Exception as e:
+                    self.append_output(f'Error in processing loop: {e}\n', tag='error')
+                    time.sleep(0.5)  # Brief pause before retrying
+
+            # Read any remaining output
+            self._read_remaining_output()
+
+            # Wait for process to complete with reasonable timeout
+            try:
+                self.process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                self.append_output('[TIMEOUT] Process did not exit cleanly, forcing termination\n', tag='error')
+                self._terminate_process_safely()
+
+            # Handle final status
+            self._handle_process_completion(total_files, processed, current_file)
+            
         except Exception as e:
             self.progress_label.config(text='Error occurred')
-            self.append_output(f'Error: {e}\n', tag='error')
+            self.append_output(f'Unexpected error in thread: {e}\n', tag='error')
         finally:
             self.run_button.config(state='normal')
             self.cancel_button.config(state='disabled')
             self.process = None
+
+    def _terminate_process_safely(self):
+        """Safely terminate the process using Windows-appropriate methods"""
+        if not self.process or self.process.poll() is not None:
+            return
+        
+        try:
+            if sys.platform == "win32":
+                # On Windows, try CTRL+C first, then terminate
+                try:
+                    self.process.send_signal(signal.CTRL_C_EVENT)
+                    self.append_output('[TERMINATING] Sending CTRL+C signal...\n', tag='warn')
+                    time.sleep(3)
+                except Exception:
+                    pass  # CTRL+C might not work, continue to terminate
+                
+                if self.process.poll() is None:
+                    self.process.terminate()
+                    self.append_output('[TERMINATING] Sending terminate signal...\n', tag='warn')
+                    time.sleep(2)
+                
+                if self.process.poll() is None:
+                    self.process.kill()
+                    self.append_output('[FORCE KILLED] Process force-killed\n', tag='error')
+            else:
+                # Unix-like systems
+                self.process.terminate()
+                time.sleep(2)
+                if self.process.poll() is None:
+                    self.process.kill()
+        except Exception as e:
+            self.append_output(f'Error during process termination: {e}\n', tag='error')
+
+    def _read_remaining_output(self):
+        """Read any remaining output from the process"""
+        try:
+            # Set a short timeout for reading remaining output
+            if self.process and self.process.stdout:
+                remaining_output = self.process.stdout.read()
+                if remaining_output and remaining_output.strip():
+                    self.append_output(remaining_output)
+        except Exception as e:
+            # Don't log this error as it's common when process is terminated
+            pass
+
+    def _handle_process_completion(self, total_files, processed, current_file):
+        """Handle the final process completion status"""
+        if not self.process:
+            return
+            
+        returncode = self.process.returncode
+        
+        if returncode == 0:
+            self.update_progress(total_files or processed, total_files or processed, current_file)
+            self.progress_label.config(text='Completed successfully')
+            self.append_output('Done.\n', tag='bold')
+        elif returncode in [-15, -9, 1]:  # SIGTERM, SIGKILL, or CTRL+C
+            self.progress_label.config(text='Cancelled or interrupted')
+            self.append_output('Process was cancelled or interrupted.\n', tag='warn')
+        elif returncode == -1073741510:  # Windows CTRL+C
+            self.progress_label.config(text='Cancelled by user')
+            self.append_output('Process was cancelled by user.\n', tag='warn')
+        else:
+            self.progress_label.config(text=f'Failed with exit code {returncode}')
+            self.append_output(f'Process exited with code {returncode}.\n', tag='error')
 
     def append_output(self, text, tag=None):
         self.output_text.config(state='normal')

@@ -180,3 +180,72 @@ Amnesia - Hysteria (Defcon Mix) [1988].flac: ERROR: while decoding FLAC input, s
 D:\Musik\Mucke unsortiert\#tmpzumsortieren\#2024\01 - 24 Hours.flac
 01 - 24 Hours.flac: ERROR: 2 consecutive FLAC__STREAM_DECODER_END_OF_STREAM events.
 
+
+flacr error log, date: 2025-07-13 17:34:28
+D:\MusicDownloads\#share\23 - Town Called Malice.flac
+ERROR: output file D:\MusicDownloads\#share\23 - Town Called Malice.flac.tmp already exists.
+
+By default flac encodes files to FLAC format; if you meant to decode this file
+from FLAC to something else, use -d.  If you meant to re-encode this file from
+FLAC to FLAC again, use -f to force writing to the same file, or -o to specify
+a different output filename.
+
+D:\MusicDownloads\#share\Drawing Future Life - The Day Of Return (With Dolphins).flac
+Drawing Future Life - The Day Of Return (With Dolphins).flac: ERROR got FLAC__STREAM_DECODER_ERROR_STATUS_FRAME_CRC_MISMATCH while decoding FLAC input
+Drawing Future Life - The Day Of Return (With Dolphins).flac: ERROR: while decoding FLAC input, state = FLAC__STREAM_DECODER_ABORTED
+
+D:\MusicDownloads\#share\01. Fix - Flash.flac
+01. Fix - Flash.flac: ERROR got FLAC__STREAM_DECODER_ERROR_STATUS_LOST_SYNC while decoding FLAC input
+01. Fix - Flash.flac: ERROR: while decoding FLAC input, state = FLAC__STREAM_DECODER_ABORTED
+
+D:\MusicDownloads\#share\04. brawther - gsm's life (mliu dub).flac
+04. brawther - gsm's life (mliu dub).flac: ERROR got FLAC__STREAM_DECODER_ERROR_STATUS_LOST_SYNC while decoding FLAC input
+04. brawther - gsm's life (mliu dub).flac: ERROR: while decoding FLAC input, state = FLAC__STREAM_DECODER_ABORTED
+
+D:\MusicDownloads\#share\01-the_horrorist-one_night_in_nyc_(chris_liebing_radio_edit).flac
+01-the_horrorist-one_night_in_nyc_(chris_liebing_radio_edit).flac: ERROR got FLAC__STREAM_DECODER_ERROR_STATUS_FRAME_CRC_MISMATCH while decoding FLAC input
+01-the_horrorist-one_night_in_nyc_(chris_liebing_radio_edit).flac: ERROR: while decoding FLAC input, state = FLAC__STREAM_DECODER_ABORTED
+
+D:\MusicDownloads\#share\1.02 - DRAWING FUTURE LIFE - BLOOD+TEARS.flac
+WARNING: D:\MusicDownloads\#share\1.02 - DRAWING FUTURE LIFE - BLOOD+TEARS.flac is not a FLAC file; treating as a raw file
+ERROR: for encoding a raw file you must specify a value for --endian, --sign, --channels, --bps, and --sample-rate
+
+D:\MusicDownloads\#share\10 Sweet Lullaby (Ambient Mix).flac
+WARNING: D:\MusicDownloads\#share\10 Sweet Lullaby (Ambient Mix).flac is not a FLAC file; treating as a raw file
+ERROR: for encoding a raw file you must specify a value for --endian, --sign, --channels, --bps, and --sample-rate
+
+D:\MusicDownloads\#share\Reggae Essentials\59 - Max Romeo - Chase The Devil.flac
+59 - Max Romeo - Chase The Devil.flac: ERROR got FLAC__STREAM_DECODER_ERROR_STATUS_LOST_SYNC while decoding FLAC input
+ERROR got FLAC__STREAM_DECODER_ERROR_STATUS_LOST_SYNC while decoding FLAC input
+59 - Max Romeo - Chase The Devil.flac: ERROR: while decoding FLAC input, state = FLAC__STREAM_DECODER_ABORTED
+
+D:\MusicDownloads\#share\01 - Pacific Melody (R&D Radio Edit).flac
+01 - Pacific Melody (R&D Radio Edit).flac: ERROR got FLAC__STREAM_DECODER_ERROR_STATUS_UNPARSEABLE_STREAM while decoding FLAC input
+ERROR got FLAC__STREAM_DECODER_ERROR_STATUS_LOST_SYNC while decoding FLAC input
+01 - Pacific Melody (R&D Radio Edit).flac: ERROR: while decoding FLAC input, state = FLAC__STREAM_DECODER_ABORTED
+
+D:\MusicDownloads\#share\Nelly - Nellyville - 25 - Hot in Herre (X-Ecutioners remix).flac
+Nelly - Nellyville - 25 - Hot in Herre (X-Ecutioners remix).flac: ERROR got FLAC__STREAM_DECODER_ERROR_STATUS_LOST_SYNC while decoding FLAC input
+Nelly - Nellyville - 25 - Hot in Herre (X-Ecutioners remix).flac: ERROR: while decoding FLAC input, state = FLAC__STREAM_DECODER_END_OF_STREAM
+
+D:\MusicDownloads\#share\02 - 24 Hours (Acid).flac
+02 - 24 Hours (Acid).flac: ERROR: 2 consecutive FLAC__STREAM_DECODER_END_OF_STREAM events.
+
+D:\MusicDownloads\#share\Amnesia - Hysteria (Defcon Mix) [1988].flac
+Amnesia - Hysteria (Defcon Mix) [1988].flac: ERROR got FLAC__STREAM_DECODER_ERROR_STATUS_LOST_SYNC while decoding FLAC input
+Amnesia - Hysteria (Defcon Mix) [1988].flac: ERROR: while decoding FLAC input, state = FLAC__STREAM_DECODER_END_OF_STREAM
+
+D:\MusicDownloads\#share\01 - 24 Hours.flac
+01 - 24 Hours.flac: ERROR: 2 consecutive FLAC__STREAM_DECODER_END_OF_STREAM events.
+
+D:\MusicDownloads\#share\04 - Touch To Remember.flac
+04 - Touch To Remember.flac: ERROR: 2 consecutive FLAC__STREAM_DECODER_END_OF_STREAM events.
+
+D:\MusicDownloads\The Volunteers - Sun Down.flac
+The Volunteers - Sun Down.flac: ERROR got FLAC__STREAM_DECODER_ERROR_STATUS_LOST_SYNC while decoding FLAC input
+The Volunteers - Sun Down.flac: ERROR: while decoding FLAC input, state = FLAC__STREAM_DECODER_ABORTED
+
+D:\MusicDownloads\#share\Razor Boy & Mirror Man - Beyond Control [1991].flac
+Razor Boy & Mirror Man - Beyond Control [1991].flac: ERROR got FLAC__STREAM_DECODER_ERROR_STATUS_LOST_SYNC while decoding FLAC input
+Razor Boy & Mirror Man - Beyond Control [1991].flac: ERROR: while decoding FLAC input, state = FLAC__STREAM_DECODER_END_OF_STREAM
+
