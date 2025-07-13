@@ -104,6 +104,7 @@ class FlacrGUI(tk.Tk):
         self.output_text.tag_configure('error', foreground='red')
         self.output_text.tag_configure('warn', foreground='orange')
         self.output_text.tag_configure('bold', font=('TkDefaultFont', 10, 'bold'))
+        self.output_text.tag_configure('skipped', foreground='blue')
 
         # Make output box expandable
         self.grid_rowconfigure(4, weight=1)
@@ -206,9 +207,11 @@ class FlacrGUI(tk.Tk):
 
     def append_output(self, text, tag=None):
         self.output_text.config(state='normal')
-        # Highlight errors/warnings
+        # Highlight errors/warnings/skipped
         if tag is None:
-            if re.search(r'error|failed|exception|not on PATH|locked|manual replacement', text, re.IGNORECASE):
+            if text.startswith('SKIPPED_FLAC:'):
+                tag = 'skipped'
+            elif re.search(r'error|failed|exception|not on PATH|locked|manual replacement', text, re.IGNORECASE):
                 tag = 'error'
             elif re.search(r'warn|skipping|cannot|missing', text, re.IGNORECASE):
                 tag = 'warn'

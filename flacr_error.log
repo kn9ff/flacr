@@ -162,3 +162,12 @@ ERROR: input file D:\Musik\Mucke unsortiert\#tmpzumsortieren\#2024\BRAVO Hits 12
 D:\Musik\Mucke unsortiert\#tmpzumsortieren\#2024\BRAVO Hits 122\224-lana_del_rey-say_yes_to_heaven.flac
 ERROR: input file D:\Musik\Mucke unsortiert\#tmpzumsortieren\#2024\BRAVO Hits 122\224-lana_del_rey-say_yes_to_heaven.flac has an ID3v2 tag
 
+
+flacr error log, date: 2025-07-13 13:26:00
+D:\Musik\Mucke unsortiert\#tmpzumsortieren\#2024\01 - 24 Hours.flac
+01 - 24 Hours.flac: ERROR: 2 consecutive FLAC__STREAM_DECODER_END_OF_STREAM events.
+
+D:\Musik\Mucke unsortiert\#tmpzumsortieren\#2024\Amnesia - Hysteria (Defcon Mix) [1988].flac
+Amnesia - Hysteria (Defcon Mix) [1988].flac: ERROR got FLAC__STREAM_DECODER_ERROR_STATUS_LOST_SYNC while decoding FLAC input
+Amnesia - Hysteria (Defcon Mix) [1988].flac: ERROR: while decoding FLAC input, state = FLAC__STREAM_DECODER_END_OF_STREAM
+
