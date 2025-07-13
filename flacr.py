@@ -163,28 +163,28 @@ def verify_flac(file_path):
 def is_flac_1_5_or_newer(file_path):
     """
     Returns True if the FLAC file was encoded with FLAC 1.5.0 or newer, else False.
+    Checks the vendor string from 'flac --list'.
     """
     try:
         result = subprocess.run(
-            ["metaflac", "--show-tag=ENCODER", file_path],
+            ["flac", "--list", file_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             check=True,
         )
-        encoder_line = result.stdout.strip()
-        # Example: ENCODER=reference libFLAC 1.5.0 20220909
-        # Match any libFLAC version 1.5.0 or newer
-        match = re.search(r"libFLAC (\d+)\.(\d+)\.(\d+)", encoder_line)
-        if match:
-            major, minor, patch = map(int, match.groups())
-            # Check if version is 1.5.0 or newer
-            if (major > 1) or (major == 1 and minor >= 5):
-                return True
-        # If no version found, assume not new enough
+        # Look for vendor string or Stream encoder line
+        for line in result.stdout.splitlines():
+            if "vendor string:" in line or "Stream encoder:" in line:
+                # Example: vendor string: reference libFLAC 1.5.0 20250211
+                match = re.search(r"libFLAC (\d+)\.(\d+)\.(\d+)", line)
+                if match:
+                    major, minor, patch = map(int, match.groups())
+                    if (major > 1) or (major == 1 and minor >= 5):
+                        return True
         return False
     except Exception:
-        # If metaflac fails or tag is missing, assume not new enough
+        # If flac --list fails, assume not new enough
         return False
 
 
