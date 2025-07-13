@@ -11,6 +11,18 @@ from datetime import datetime
 import re
 
 
+def safe_print(text):
+    """
+    Print text safely, handling Unicode encoding errors by replacing problematic characters.
+    """
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        # Replace Unicode characters that can't be encoded in the console's encoding
+        safe_text = text.encode('ascii', 'replace').decode('ascii')
+        print(safe_text)
+
+
 def parse_arguments():
     def dir_path(path):
         if os.path.isdir(path) and path != None:
@@ -363,8 +375,8 @@ def is_flac_1_5_or_newer(file_path):
                 return True
             else:
                 # File was encoded with a different version, consider re-encoding
-                print(f"File {file_path} was encoded with libFLAC {'.'.join(map(str, file_version))}, "
-                      f"but system has libFLAC {'.'.join(map(str, system_version))}. Will re-encode for consistency.")
+                safe_print(f"File {file_path} was encoded with libFLAC {'.'.join(map(str, file_version))}, "
+                          f"but system has libFLAC {'.'.join(map(str, system_version))}. Will re-encode for consistency.")
                 return False
     
     return is_new_enough
@@ -391,7 +403,7 @@ def reencode_flac(file_path, thread_count=1):
             check=True,
         )
         if result.stderr:
-            print(f"Error encountered while re-encoding {file_path}:\n{result.stderr}")
+            safe_print(f"Error encountered while re-encoding {file_path}:\n{result.stderr}")
             os.remove(temp_file_path)
         else:
             # Replace the original file with the temporary file
@@ -570,9 +582,9 @@ def process_encoder_metadata(flac_files, progress):
                 files_with_issues += 1
                 if fixed:
                     files_fixed += 1
-                    print(f"FIXED: {flac_file} - {', '.join(issues)}")
+                    safe_print(f"FIXED: {flac_file} - {', '.join(issues)}")
                 else:
-                    print(f"ISSUES: {flac_file} - {', '.join(issues)}")
+                    safe_print(f"ISSUES: {flac_file} - {', '.join(issues)}")
             
             pbar.update(1)
             pbar.set_postfix({"issues": files_with_issues, "fixed": files_fixed})
@@ -622,7 +634,7 @@ def main(args):
         if not is_flac_1_5_or_newer(f):
             files_to_reencode.append(f)
         else:
-            print(f"Skipping {f}: already encoded with FLAC 1.5.0 or newer.")
+            safe_print(f"Skipping {f}: already encoded with FLAC 1.5.0 or newer.")
 
     flac_files = files_to_reencode
 
