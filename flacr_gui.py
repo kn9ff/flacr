@@ -81,6 +81,10 @@ class FlacrGUI(tk.Tk):
         self.S_check = tk.Checkbutton(self.options_frame, text='Sequential mode (-S)', variable=self.S_var, command=self.update_option_states)
         self.S_check.grid(row=3, column=1, sticky='w')
 
+        self.E_var = tk.BooleanVar()
+        self.E_check = tk.Checkbutton(self.options_frame, text='Check ENCODER metadata (-E)', variable=self.E_var)
+        self.E_check.grid(row=3, column=2, sticky='w')
+
         # Progress bar
         self.progress = ttk.Progressbar(self, orient='horizontal', mode='determinate', length=400)
         self.progress.grid(row=2, column=0, pady=10, padx=10, sticky='ew')
@@ -178,6 +182,8 @@ class FlacrGUI(tk.Tk):
             args.append('-Q')
         if self.S_var.get():
             args.append('-S')
+        if self.E_var.get():
+            args.append('-E')
         return args
 
     def _run_flacr_thread(self, args):
@@ -228,6 +234,8 @@ class FlacrGUI(tk.Tk):
         missing = []
         if not shutil.which('flac'):
             missing.append('flac')
+        if not shutil.which('metaflac'):
+            missing.append('metaflac')
         if self.r_var.get() and not shutil.which('rsgain'):
             missing.append('rsgain')
         if missing:
@@ -262,7 +270,8 @@ class FlacrGUI(tk.Tk):
             '-s: Only scan the current folder.\n'
             '-t: Test only, skip recompression.\n'
             '-Q: Quick mode: -r -p and -m with all available threads.\n'
-            '-S: Sequential mode: -j -r -p and -m 4.\n\n'
+            '-S: Sequential mode: -j -r -p and -m 4.\n'
+            '-E: Check and fix ENCODER metadata tags.\n\n'
             'Common examples:\n'
             'Test flac files for errors (4 threads):\n'
             '  flacr.py -t -m 4\n'
@@ -272,6 +281,8 @@ class FlacrGUI(tk.Tk):
             '  flacr.py -Q\n'
             'Sequential mode (4 threads, progress):\n'
             '  flacr.py -S\n'
+            'Check and fix ENCODER metadata:\n'
+            '  flacr.py -E\n'
             'With directory:\n'
             '  flacr.py -rlp -m 4 -d "D:/Test"\n\n'
             'Documentation:\n'
@@ -343,6 +354,7 @@ class FlacrGUI(tk.Tk):
         config.set('main', 't', str(self.t_var.get()))
         config.set('main', 'Q', str(self.Q_var.get()))
         config.set('main', 'S', str(self.S_var.get()))
+        config.set('main', 'E', str(self.E_var.get()))
         with open(CONFIG_PATH, 'w') as f:
             config.write(f)
 
@@ -361,6 +373,7 @@ class FlacrGUI(tk.Tk):
                 self.t_var.set(config.getboolean('main', 't', fallback=False))
                 self.Q_var.set(config.getboolean('main', 'Q', fallback=False))
                 self.S_var.set(config.getboolean('main', 'S', fallback=False))
+                self.E_var.set(config.getboolean('main', 'E', fallback=False))
                 self.update_option_states()
 
     def on_close(self):

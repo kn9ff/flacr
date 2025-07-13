@@ -98,6 +98,12 @@ def parse_arguments():
         action="store_true",
         help="Equal to using -m 4 -j to encode 1 file at a time with 4 threads, -r to calculate replay gain values and -p to display a progress bar.",
     )
+    parser.add_argument(
+        "-E",
+        "--check-encoder",
+        action="store_true",
+        help="Check and fix ENCODER metadata tags. Ensures each file has a single ENCODER tag matching the vendor string from the file's STREAMINFO.",
+    )
 
     args: argparse.Namespace = parser.parse_args()
 
@@ -160,32 +166,208 @@ def verify_flac(file_path):
         return file_path, e.stderr
 
 
-def is_flac_1_5_or_newer(file_path):
+def get_system_flac_version():
     """
-    Returns True if the FLAC file was encoded with FLAC 1.5.0 or newer, else False.
-    Checks the vendor string from 'flac --list'.
+    Returns the version tuple (major, minor, patch) of the local flac binary, or None if not found.
     """
     try:
         result = subprocess.run(
-            ["flac", "--list", file_path],
+            ["flac", "--version"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             check=True,
         )
-        # Look for vendor string or Stream encoder line
-        for line in result.stdout.splitlines():
-            if "vendor string:" in line or "Stream encoder:" in line:
-                # Example: vendor string: reference libFLAC 1.5.0 20250211
-                match = re.search(r"libFLAC (\d+)\.(\d+)\.(\d+)", line)
-                if match:
-                    major, minor, patch = map(int, match.groups())
-                    if (major > 1) or (major == 1 and minor >= 5):
-                        return True
-        return False
+        # Example output: "flac 1.5.0" or "flac 1.5.0 20250211"
+        m = re.search(r"flac (\d+)\.(\d+)\.(\d+)", result.stdout)
+        if m:
+            return tuple(map(int, m.groups()))
     except Exception:
-        # If flac --list fails, assume not new enough
+        pass
+    return None
+
+
+def get_flac_encoder_string():
+    """
+    Returns the encoder string, e.g. 'reference libFLAC 1.5.0', from the local flac binary.
+    """
+    try:
+        result = subprocess.run(
+            ["flac", "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+        # Example output: "flac 1.5.0" or "flac 1.5.0 20250211"
+        # First try to match version with optional date
+        m = re.search(r"flac (\d+\.\d+\.\d+)(?:\s+(\d+))?", result.stdout)
+        if m:
+            version = m.group(1)
+            date = m.group(2)
+            if date:
+                return f"reference libFLAC {version} {date}"
+            else:
+                return f"reference libFLAC {version}"
+    except Exception:
+        pass
+    return "reference libFLAC"
+
+
+def get_file_flac_version(file_path):
+    """
+    Returns the version tuple (major, minor, patch) of the FLAC encoder used to encode the file, or None if not found.
+    Checks the vendor string from the VORBIS_COMMENT block using metaflac.
+    """
+    try:
+        result = subprocess.run(
+            ["metaflac", "--show-vendor-tag", file_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+        # Example output: "reference libFLAC 1.4.2 20221022"
+        match = re.search(r"libFLAC (\d+)\.(\d+)\.(\d+)", result.stdout)
+        if match:
+            return tuple(map(int, match.groups()))
+        return None
+    except Exception:
+        return None
+
+
+def get_file_encoder_string(file_path):
+    """
+    Returns the full encoder string from the vendor tag, or None if not found.
+    Example: "reference libFLAC 1.4.2 20221022"
+    """
+    try:
+        result = subprocess.run(
+            ["metaflac", "--show-vendor-tag", file_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip() if result.stdout.strip() else None
+    except Exception:
+        return None
+
+
+def get_encoder_metadata_tags(file_path):
+    """
+    Returns a list of ENCODER metadata tag values from the file, or empty list if none found.
+    """
+    try:
+        result = subprocess.run(
+            ["metaflac", "--show-tag=ENCODER", file_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+        # Output format: "ENCODER=reference libFLAC 1.5.0" (one per line if multiple)
+        encoder_tags = []
+        for line in result.stdout.strip().split('\n'):
+            if line.startswith('ENCODER='):
+                encoder_tags.append(line[8:])  # Remove "ENCODER=" prefix
+        return encoder_tags
+    except Exception:
+        return []
+
+
+def check_and_fix_encoder_metadata(file_path, fix_issues=True):
+    """
+    Checks if the ENCODER metadata field is properly filled and fixes issues if requested.
+    Returns a tuple (needs_fix, issues_found, fixed) where:
+    - needs_fix: True if the file had encoder metadata issues
+    - issues_found: list of issues found
+    - fixed: True if issues were successfully fixed
+    """
+    issues_found = []
+    fixed = False
+    
+    # Get current ENCODER tags
+    encoder_tags = get_encoder_metadata_tags(file_path)
+    
+    # Get the actual encoder string from vendor tag
+    file_encoder_string = get_file_encoder_string(file_path)
+    
+    if not file_encoder_string:
+        issues_found.append("No vendor tag found in file")
+        return True, issues_found, False
+    
+    # Check for missing ENCODER tag
+    if not encoder_tags:
+        issues_found.append("Missing ENCODER metadata tag")
+    
+    # Check for duplicate ENCODER tags
+    elif len(encoder_tags) > 1:
+        issues_found.append(f"Duplicate ENCODER tags found: {len(encoder_tags)} entries")
+    
+    # Check if ENCODER tag matches the vendor string
+    elif len(encoder_tags) == 1:
+        current_encoder = encoder_tags[0]
+        if current_encoder != file_encoder_string:
+            if current_encoder == "reference libFLAC":
+                issues_found.append("ENCODER tag missing version information")
+            else:
+                issues_found.append(f"ENCODER tag mismatch: '{current_encoder}' vs vendor '{file_encoder_string}'")
+    
+    # Fix issues if requested
+    if issues_found and fix_issues:
+        try:
+            # Remove all existing ENCODER tags first
+            if encoder_tags:
+                subprocess.run(
+                    ["metaflac", "--remove-tag=ENCODER", file_path],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=True,
+                )
+            
+            # Set the correct ENCODER tag based on vendor string
+            subprocess.run(
+                ["metaflac", f"--set-tag=ENCODER={file_encoder_string}", file_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+            )
+            fixed = True
+        except Exception as e:
+            issues_found.append(f"Failed to fix ENCODER metadata: {e}")
+    
+    needs_fix = len(issues_found) > 0
+    return needs_fix, issues_found, fixed
+
+
+def is_flac_1_5_or_newer(file_path):
+    """
+    Returns True if the FLAC file was encoded with FLAC 1.5.0 or newer, else False.
+    Also checks if the file's encoder version matches the system's flac version.
+    """
+    file_version = get_file_flac_version(file_path)
+    if file_version is None:
         return False
+    
+    major, minor, patch = file_version
+    is_new_enough = (major > 1) or (major == 1 and minor >= 5)
+    
+    if is_new_enough:
+        # Check if file version matches system version
+        system_version = get_system_flac_version()
+        if system_version is not None:
+            if file_version == system_version:
+                return True
+            else:
+                # File was encoded with a different version, consider re-encoding
+                print(f"File {file_path} was encoded with libFLAC {'.'.join(map(str, file_version))}, "
+                      f"but system has libFLAC {'.'.join(map(str, system_version))}. Will re-encode for consistency.")
+                return False
+    
+    return is_new_enough
 
 
 def reencode_flac(file_path, thread_count=1):
@@ -216,6 +398,14 @@ def reencode_flac(file_path, thread_count=1):
             try:
                 os.remove(file_path)
                 os.rename(temp_file_path, file_path)
+                # Set ENCODER tag
+                encoder_str = get_flac_encoder_string()
+                subprocess.run(
+                    ["metaflac", f"--set-tag=ENCODER={encoder_str}", file_path],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
             except PermissionError as e:
                 print(
                     f"Could not replace {file_path} because it is locked. The temporary file remains: {temp_file_path}"
@@ -358,6 +548,38 @@ def flac_version_check():
         sys.exit()
 
 
+def process_encoder_metadata(flac_files, progress):
+    """
+    Process all FLAC files to check and fix ENCODER metadata tags.
+    Returns a count of files that had issues and how many were fixed.
+    """
+    files_with_issues = 0
+    files_fixed = 0
+    
+    with tqdm(
+        total=len(flac_files),
+        desc="checking encoder metadata",
+        unit=" files",
+        disable=not progress,
+        ncols=100,
+    ) as pbar:
+        for flac_file in flac_files:
+            needs_fix, issues, fixed = check_and_fix_encoder_metadata(flac_file, fix_issues=True)
+            
+            if needs_fix:
+                files_with_issues += 1
+                if fixed:
+                    files_fixed += 1
+                    print(f"FIXED: {flac_file} - {', '.join(issues)}")
+                else:
+                    print(f"ISSUES: {flac_file} - {', '.join(issues)}")
+            
+            pbar.update(1)
+            pbar.set_postfix({"issues": files_with_issues, "fixed": files_fixed})
+    
+    return files_with_issues, files_fixed
+
+
 def main(args):
     args = parse_arguments()
     directory = args.directory
@@ -368,9 +590,15 @@ def main(args):
     single_folder = args.single_folder
     test_run = args.test
     multi_threaded = args.j
+    check_encoder = args.check_encoder
 
     # Check if flac executable is available on PATH and abort if it is not.
     flac_on_path()
+    
+    # Check metaflac availability for encoder metadata checking
+    if check_encoder and shutil.which("metaflac") is None:
+        print("metaflac is required for encoder metadata checking but is not on PATH.")
+        sys.exit()
 
     if calc_rsgain:
         # Check if rsgain executable is available on PATH and abort if it is not.
@@ -378,6 +606,17 @@ def main(args):
 
     # Collect paths of all .flac files
     flac_files = find_flac_files(directory, single_folder, progress)
+    
+    # Check and fix ENCODER metadata if requested
+    if check_encoder:
+        print(f"Checking ENCODER metadata for {len(flac_files)} FLAC files...")
+        files_with_issues, files_fixed = process_encoder_metadata(flac_files, progress)
+        print(f"ENCODER metadata check completed: {files_with_issues} files had issues, {files_fixed} were fixed.")
+        
+        # If only checking encoder metadata, exit here
+        if not test_run and not calc_rsgain:
+            return
+    
     files_to_reencode = []
     for f in flac_files:
         if not is_flac_1_5_or_newer(f):
