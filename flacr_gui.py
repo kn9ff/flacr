@@ -26,6 +26,8 @@ class FlacrGUI(tk.Tk):
                 pass
         self.geometry('700x650')
         self.minsize(600, 500)
+        self.process = None  # Track running process for cancellation
+        self.max_log_lines = 1000  # Auto-truncate after this many lines
         self.create_widgets()
         self.load_settings()
         self.protocol('WM_DELETE_WINDOW', self.on_close)
@@ -95,7 +97,7 @@ class FlacrGUI(tk.Tk):
         # Progress bar and label
         self.progress_frame = tk.Frame(self)
         self.progress_frame.grid(row=2, column=0, pady=10, padx=10, sticky='ew')
-        self.progress_label = tk.Label(self.progress_frame, text='', anchor='w', bg='#f8f8f8')
+        self.progress_label = tk.Label(self.progress_frame, text='Ready', anchor='w', bg='#f0f0f0', relief='sunken', padx=5)
         self.progress_label.pack(fill='x', side='top')
         self.progress = ttk.Progressbar(self.progress_frame, orient='horizontal', mode='determinate', length=400)
         self.progress.pack(fill='x', side='top', pady=(2,0))
@@ -106,12 +108,14 @@ class FlacrGUI(tk.Tk):
         btn_frame.grid_columnconfigure(0, weight=1)
         self.run_button = tk.Button(btn_frame, text='Run', command=self.run_flacr)
         self.run_button.grid(row=0, column=0, padx=5, sticky='w')
+        self.cancel_button = tk.Button(btn_frame, text='Cancel', command=self.cancel_flacr, state='disabled')
+        self.cancel_button.grid(row=0, column=1, padx=5, sticky='w')
         self.log_button = tk.Button(btn_frame, text='View Error Log', command=self.open_error_log)
-        self.log_button.grid(row=0, column=1, padx=5, sticky='w')
+        self.log_button.grid(row=0, column=2, padx=5, sticky='w')
         self.help_button = tk.Button(btn_frame, text='Help', command=self.show_help)
-        self.help_button.grid(row=0, column=2, padx=5, sticky='w')
+        self.help_button.grid(row=0, column=3, padx=5, sticky='w')
         self.copy_cmd_button = tk.Button(btn_frame, text='Copy CLI Command', command=self.copy_cli_command)
-        self.copy_cmd_button.grid(row=0, column=3, padx=5, sticky='w')
+        self.copy_cmd_button.grid(row=0, column=4, padx=5, sticky='w')
 
         # Output box with tag for error highlighting
         self.output_text = tk.Text(self, height=15, width=80, state='normal', wrap='word')
@@ -142,14 +146,23 @@ class FlacrGUI(tk.Tk):
                 return
         self.save_settings()
         self.run_button.config(state='disabled')
+        self.cancel_button.config(state='normal')
         self.output_text.config(state='normal')
         self.output_text.delete(1.0, tk.END)
         self.output_text.insert(tk.END, 'Running flacr...\n', 'bold')
         self.output_text.config(state='disabled')
         self.progress['value'] = 0
-        self.progress_label.config(text='')
+        self.progress_label.config(text='Starting...')
         args = self.build_args()
         threading.Thread(target=self._run_flacr_thread, args=(args,), daemon=True).start()
+
+    def cancel_flacr(self):
+        """Cancel the running flacr process"""
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            self.append_output('\n[CANCELLED BY USER]\n', tag='error')
+            self.run_button.config(state='normal')
+            self.cancel_button.config(state='disabled')
 
     def tqdm_installed(self):
         try:
@@ -200,12 +213,16 @@ class FlacrGUI(tk.Tk):
 
     def _run_flacr_thread(self, args):
         try:
-            process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            self.process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
             total_files = None
             processed = 0
             current_file = ''
 
-            for line in process.stdout:
+            for line in self.process.stdout:
+                # Check if process was cancelled
+                if self.process.poll() is not None:
+                    break
+                    
                 self.append_output(line)
 
                 # Extract total files from summary lines if not already set
@@ -222,20 +239,35 @@ class FlacrGUI(tk.Tk):
                     current_file = file_line.group(2).strip()
                     self.update_progress(processed, total_files or processed, current_file)
 
-            process.wait()
-            self.update_progress(total_files or processed, total_files or processed, current_file)
-
-            if process.returncode == 0:
+            self.process.wait()
+            
+            if self.process.returncode == 0:
+                self.update_progress(total_files or processed, total_files or processed, current_file)
+                self.progress_label.config(text='Completed successfully')
                 self.append_output('Done.\n', tag='bold')
+            elif self.process.returncode == -15:  # SIGTERM (cancelled)
+                self.progress_label.config(text='Cancelled by user')
             else:
-                self.append_output(f'Process exited with code {process.returncode}.\n', tag='error')
+                self.progress_label.config(text=f'Failed with exit code {self.process.returncode}')
+                self.append_output(f'Process exited with code {self.process.returncode}.\n', tag='error')
         except Exception as e:
+            self.progress_label.config(text='Error occurred')
             self.append_output(f'Error: {e}\n', tag='error')
         finally:
             self.run_button.config(state='normal')
+            self.cancel_button.config(state='disabled')
+            self.process = None
 
     def append_output(self, text, tag=None):
         self.output_text.config(state='normal')
+        
+        # Auto-truncate log if it gets too long
+        current_lines = int(self.output_text.index('end-1c').split('.')[0])
+        if current_lines > self.max_log_lines:
+            # Remove first 200 lines to prevent constant truncation
+            self.output_text.delete('1.0', '201.0')
+            self.output_text.insert('1.0', '[... earlier output truncated ...]\n', 'warn')
+        
         # Highlight errors/warnings/skipped
         if tag is None:
             if text.startswith('SKIPPED_FLAC:'):
@@ -251,11 +283,16 @@ class FlacrGUI(tk.Tk):
     def update_progress(self, value, maximum, current_file=None):
         self.progress['maximum'] = maximum
         self.progress['value'] = value
+        
         if current_file:
             display_file = os.path.basename(current_file)
-            self.progress_label.config(text=f'File: {display_file}   ({value}/{maximum})')
+            percentage = (value / maximum * 100) if maximum > 0 else 0
+            self.progress_label.config(text=f'Processing: {display_file}   ({value}/{maximum} - {percentage:.1f}%)')
+        elif maximum > 0:
+            percentage = (value / maximum * 100)
+            self.progress_label.config(text=f'Progress: {value}/{maximum} files ({percentage:.1f}%)')
         else:
-            self.progress_label.config(text=f'({value}/{maximum})')
+            self.progress_label.config(text=f'Processing... ({value} files)')
         self.update_idletasks()
 
     def check_dependencies(self):
