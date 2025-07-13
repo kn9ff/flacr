@@ -92,9 +92,13 @@ class FlacrGUI(tk.Tk):
         self.E_check = tk.Checkbutton(self.options_frame, text='Check ENCODER metadata (-E)', variable=self.E_var)
         self.E_check.grid(row=3, column=2, sticky='w')
 
-        # Progress bar
-        self.progress = ttk.Progressbar(self, orient='horizontal', mode='determinate', length=400)
-        self.progress.grid(row=2, column=0, pady=10, padx=10, sticky='ew')
+        # Progress bar and label
+        self.progress_frame = tk.Frame(self)
+        self.progress_frame.grid(row=2, column=0, pady=10, padx=10, sticky='ew')
+        self.progress_label = tk.Label(self.progress_frame, text='', anchor='w', bg='#f8f8f8')
+        self.progress_label.pack(fill='x', side='top')
+        self.progress = ttk.Progressbar(self.progress_frame, orient='horizontal', mode='determinate', length=400)
+        self.progress.pack(fill='x', side='top', pady=(2,0))
 
         # Run and log buttons
         btn_frame = tk.Frame(self)
@@ -110,7 +114,7 @@ class FlacrGUI(tk.Tk):
         self.copy_cmd_button.grid(row=0, column=3, padx=5, sticky='w')
 
         # Output box with tag for error highlighting
-        self.output_text = tk.Text(self, height=15, width=80, state='disabled', wrap='word')
+        self.output_text = tk.Text(self, height=15, width=80, state='normal', wrap='word')
         self.output_text.grid(row=4, column=0, padx=10, pady=5, sticky='nsew')
         self.output_text.tag_configure('error', foreground='red')
         self.output_text.tag_configure('warn', foreground='orange')
@@ -143,6 +147,7 @@ class FlacrGUI(tk.Tk):
         self.output_text.insert(tk.END, 'Running flacr...\n', 'bold')
         self.output_text.config(state='disabled')
         self.progress['value'] = 0
+        self.progress_label.config(text='')
         args = self.build_args()
         threading.Thread(target=self._run_flacr_thread, args=(args,), daemon=True).start()
 
@@ -198,17 +203,28 @@ class FlacrGUI(tk.Tk):
             process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
             total_files = None
             processed = 0
+            current_file = ''
+
             for line in process.stdout:
                 self.append_output(line)
-                # Progress bar update: parse tqdm output
-                # Look for lines like: "encoding:  23%|██▎       | 7/30 [00:01<00:04,  5.00 files/s]"
-                tqdm_match = re.search(r'(encoding|verifying|searching).*\|\s*(\d+)/(\d+)', line)
-                if tqdm_match:
-                    processed = int(tqdm_match.group(2))
-                    total_files = int(tqdm_match.group(3))
-                    self.update_progress(processed, total_files)
+
+                # Extract total files from summary lines if not already set
+                if total_files is None:
+                    summary_match = re.search(r'(\d+) flac files', line)
+                    if summary_match:
+                        total_files = int(summary_match.group(1))
+                        self.progress['maximum'] = total_files
+
+                # Update progress based on processed files
+                file_line = re.search(r'(Processing|Verifying|Encoding|Checking):\s*(.+\.flac)', line, re.IGNORECASE)
+                if file_line:
+                    processed += 1
+                    current_file = file_line.group(2).strip()
+                    self.update_progress(processed, total_files or processed, current_file)
+
             process.wait()
-            self.update_progress(total_files or 0, total_files or 1)
+            self.update_progress(total_files or processed, total_files or processed, current_file)
+
             if process.returncode == 0:
                 self.append_output('Done.\n', tag='bold')
             else:
@@ -232,9 +248,14 @@ class FlacrGUI(tk.Tk):
         self.output_text.see(tk.END)
         self.output_text.config(state='disabled')
 
-    def update_progress(self, value, maximum):
+    def update_progress(self, value, maximum, current_file=None):
         self.progress['maximum'] = maximum
         self.progress['value'] = value
+        if current_file:
+            display_file = os.path.basename(current_file)
+            self.progress_label.config(text=f'File: {display_file}   ({value}/{maximum})')
+        else:
+            self.progress_label.config(text=f'({value}/{maximum})')
         self.update_idletasks()
 
     def check_dependencies(self):
