@@ -9,6 +9,15 @@ import concurrent.futures
 from tqdm import tqdm
 from datetime import datetime
 import re
+import logging
+
+# Constants
+FLAC_EXTENSION = ".flac"
+TEMP_EXTENSION = ".tmp"
+LOG_FILENAME = "flacr_error.log"
+MIN_FLAC_VERSION = (1, 5, 0)
+DEFAULT_PADDING = 4096
+MIN_RSGAIN_THREADS = 2
 
 
 def safe_print(text):
@@ -21,6 +30,25 @@ def safe_print(text):
         # Replace Unicode characters that can't be encoded in the console's encoding
         safe_text = text.encode('ascii', 'replace').decode('ascii')
         print(safe_text)
+
+
+def validate_dependencies(check_encoder=False, calc_rsgain=False):
+    """
+    Validate that all required dependencies are available.
+    Returns a list of missing dependencies.
+    """
+    missing = []
+    
+    if not shutil.which("flac"):
+        missing.append("flac")
+    
+    if check_encoder and not shutil.which("metaflac"):
+        missing.append("metaflac")
+    
+    if calc_rsgain and not shutil.which("rsgain"):
+        missing.append("rsgain")
+    
+    return missing
 
 
 def parse_arguments():
@@ -48,7 +76,7 @@ def parse_arguments():
     parser.add_argument(
         "-d",
         "--directory",
-        help="The directory that will be recursively scanned for .lrc and .txt files.",
+        help="The directory that will be recursively scanned for .flac files.",
         type=dir_path,
         default=".",
         const=".",
@@ -136,29 +164,52 @@ def parse_arguments():
 
 
 def find_flac_files(directory, single_folder, progress):
+    """
+    Find all FLAC files in the specified directory.
+    
+    Args:
+        directory: Directory to search
+        single_folder: If True, only search current folder, not subdirectories
+        progress: Whether to show progress bar
+    
+    Returns:
+        List of absolute paths to FLAC files
+    """
     flac_files = []
-    if not single_folder:
-        with tqdm(
-            desc="searching", unit=" files", disable=not progress, ncols=100
-        ) as pbar:
-            flac_count = 0
-            for root, dirs, files in os.walk(directory):
-                for file in files:
-                    pbar.update(1)
-                    if file.endswith(".flac"):
-                        flac_files.append(os.path.join(os.path.abspath(root), file))
-                        flac_count += 1
-                        pbar.set_postfix({"flac files": flac_count})
-    else:
-        with tqdm(
-            desc="searching", unit=" files", disable=not progress, ncols=100
-        ) as pbar:
-            flac_count = 0
-            for file in os.listdir(directory):
-                if file.endswith(".flac"):
-                    flac_files.append(os.path.join(os.path.abspath(directory), file))
-                    flac_count += 1
-                    pbar.set_postfix({"flac files": flac_count})
+    
+    try:
+        if not single_folder:
+            with tqdm(
+                desc="searching", unit=" files", disable=not progress, ncols=100
+            ) as pbar:
+                flac_count = 0
+                for root, dirs, files in os.walk(directory):
+                    for file in files:
+                        pbar.update(1)
+                        if file.lower().endswith(FLAC_EXTENSION):
+                            flac_files.append(os.path.join(os.path.abspath(root), file))
+                            flac_count += 1
+                            pbar.set_postfix({"flac files": flac_count})
+        else:
+            with tqdm(
+                desc="searching", unit=" files", disable=not progress, ncols=100
+            ) as pbar:
+                flac_count = 0
+                for file in os.listdir(directory):
+                    if file.lower().endswith(FLAC_EXTENSION):
+                        file_path = os.path.join(os.path.abspath(directory), file)
+                        if os.path.isfile(file_path):  # Ensure it's actually a file
+                            flac_files.append(file_path)
+                            flac_count += 1
+                            pbar.set_postfix({"flac files": flac_count})
+                        pbar.update(1)
+    except PermissionError as e:
+        safe_print(f"Permission denied accessing directory {directory}: {e}")
+        return []
+    except Exception as e:
+        safe_print(f"Error scanning directory {directory}: {e}")
+        return []
+    
     return flac_files
 
 
@@ -383,11 +434,21 @@ def is_flac_1_5_or_newer(file_path):
 
 
 def reencode_flac(file_path, thread_count=1):
+    """
+    Re-encode a FLAC file with optimal settings.
+    
+    Args:
+        file_path: Path to the FLAC file
+        thread_count: Number of threads to use for encoding
+    
+    Returns:
+        Tuple of (file_path, error_message)
+    """
     # Define the temporary output file path
-    temp_file_path = file_path + ".tmp"
+    temp_file_path = file_path + TEMP_EXTENSION
 
     # Define the re-encoding command
-    command = ["flac", "--best", "--verify", "--padding=4096", "--silent"]
+    command = ["flac", "--best", "--verify", f"--padding={DEFAULT_PADDING}", "--silent"]
 
     if thread_count > 1:
         command.append(f"--threads={thread_count}")
@@ -401,15 +462,34 @@ def reencode_flac(file_path, thread_count=1):
             stderr=subprocess.PIPE,
             text=True,
             check=True,
+            timeout=3600  # 1 hour timeout for safety
         )
+        
         if result.stderr:
             safe_print(f"Error encountered while re-encoding {file_path}:\n{result.stderr}")
-            os.remove(temp_file_path)
+            # Clean up temp file on error
+            if os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                except OSError:
+                    pass
+            return file_path, result.stderr
         else:
             # Replace the original file with the temporary file
             try:
+                # Verify temp file exists and has content
+                if not os.path.exists(temp_file_path) or os.path.getsize(temp_file_path) == 0:
+                    return file_path, "Temporary file is missing or empty"
+                
+                # Create backup of original file permissions
+                original_stat = os.stat(file_path)
+                
                 os.remove(file_path)
                 os.rename(temp_file_path, file_path)
+                
+                # Restore original permissions
+                os.chmod(file_path, original_stat.st_mode)
+                
                 # Remove any existing ENCODER tags first, then set the new one
                 subprocess.run(
                     ["metaflac", "--remove-tag=ENCODER", file_path],
@@ -425,31 +505,75 @@ def reencode_flac(file_path, thread_count=1):
                     stderr=subprocess.PIPE,
                     text=True,
                 )
-            except PermissionError as e:
-                print(
-                    f"Could not replace {file_path} because it is locked. The temporary file remains: {temp_file_path}"
-                )
-                print(
-                    f"Please close any programs using {file_path} and manually replace it with {temp_file_path}."
-                )
-                return file_path, "File locked. Manual replacement required."
-        return file_path, result.stderr
+            except PermissionError:
+                return file_path, f"File locked. Manual replacement required. Temporary file: {temp_file_path}"
+            except OSError as e:
+                return file_path, f"File system error: {e}. Temporary file: {temp_file_path}"
+                
+        return file_path, ""
+        
+    except subprocess.TimeoutExpired:
+        # Clean up on timeout
+        if os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except OSError:
+                pass
+        return file_path, "Encoding timeout (1 hour limit exceeded)"
     except subprocess.CalledProcessError as e:
-        # If an error occurs, return the filepath and stderr
+        # Clean up on process error
+        if os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except OSError:
+                pass
         return file_path, e.stderr
+    except Exception as e:
+        # Clean up on unexpected error
+        if os.path.exists(temp_file_path):
+            try:
+                os.remove(temp_file_path)
+            except OSError:
+                pass
+        return file_path, f"Unexpected error: {e}"
 
 
 def run_rsgain(directory, thread_count):
-    # set rsgain thread count to at least 2 to prevent windows cli limitations to hinder performance
+    """
+    Calculate replay gain values using rsgain.
+    
+    Args:
+        directory: Directory to process
+        thread_count: Number of threads to use
+    """
+    # Set rsgain thread count to at least 2 to prevent windows cli limitations
     if thread_count == 1:
-        thread_count = 2
+        thread_count = MIN_RSGAIN_THREADS
+        
     # Define the replay gain calculation command
     rs_gain_command = ["rsgain", "easy", "-m", str(thread_count), directory]
+    
     try:
-        subprocess.run(rs_gain_command, check=True)
+        result = subprocess.run(
+            rs_gain_command, 
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=7200  # 2 hour timeout for large directories
+        )
+        if result.stdout:
+            safe_print(f"rsgain output: {result.stdout}")
+    except subprocess.TimeoutExpired:
+        safe_print("rsgain calculation timed out (2 hour limit)")
+        sys.exit(1)
     except subprocess.CalledProcessError as e:
-        print(f"Error while executing rsgain.\n{e}")
-        sys.exit()
+        safe_print(f"Error while executing rsgain: {e}")
+        if e.stderr:
+            safe_print(f"rsgain stderr: {e.stderr}")
+        sys.exit(1)
+    except Exception as e:
+        safe_print(f"Unexpected error running rsgain: {e}")
+        sys.exit(1)
 
 
 def write_log(error_log):
@@ -600,6 +724,9 @@ def process_encoder_metadata(flac_files, progress):
 
 
 def main(args):
+    """
+    Main function to orchestrate the FLAC processing workflow.
+    """
     args = parse_arguments()
     directory = args.directory
     log_to_disk = args.log
@@ -611,31 +738,48 @@ def main(args):
     multi_threaded = args.j
     check_encoder = args.check_encoder
 
-    # Check if flac executable is available on PATH and abort if it is not.
-    flac_on_path()
-    
-    # Check metaflac availability for encoder metadata checking
-    if check_encoder and shutil.which("metaflac") is None:
-        print("metaflac is required for encoder metadata checking but is not on PATH.")
-        sys.exit()
+    # Validate all dependencies upfront
+    missing_deps = validate_dependencies(check_encoder, calc_rsgain)
+    if missing_deps:
+        safe_print(f"Missing required dependencies: {', '.join(missing_deps)}")
+        safe_print("Please install the missing tools and ensure they are in your PATH.")
+        sys.exit(1)
 
-    if calc_rsgain:
-        # Check if rsgain executable is available on PATH and abort if it is not.
-        calc_rsgain = rsgain_on_path()
+    # Legacy dependency checks for interactive setup (Windows only)
+    if sys.platform == "win32":
+        flac_on_path()
+        if calc_rsgain:
+            calc_rsgain = rsgain_on_path()
+
+    # Validate directory exists and is accessible
+    if not os.path.exists(directory):
+        safe_print(f"Error: Directory '{directory}' does not exist.")
+        sys.exit(1)
+    if not os.access(directory, os.R_OK):
+        safe_print(f"Error: No read permission for directory '{directory}'.")
+        sys.exit(1)
 
     # Collect paths of all .flac files
+    safe_print(f"Scanning directory: {directory}")
     flac_files = find_flac_files(directory, single_folder, progress)
+    
+    if not flac_files:
+        safe_print("No FLAC files found in the specified directory.")
+        return
+
+    safe_print(f"Found {len(flac_files)} FLAC files.")
     
     # Check and fix ENCODER metadata if requested
     if check_encoder:
-        print(f"Checking ENCODER metadata for {len(flac_files)} FLAC files...")
+        safe_print(f"Checking ENCODER metadata for {len(flac_files)} FLAC files...")
         files_with_issues, files_fixed = process_encoder_metadata(flac_files, progress)
-        print(f"ENCODER metadata check completed: {files_with_issues} files had issues, {files_fixed} were fixed.")
+        safe_print(f"ENCODER metadata check completed: {files_with_issues} files had issues, {files_fixed} were fixed.")
         
         # If only checking encoder metadata, exit here
         if not test_run and not calc_rsgain:
             return
     
+    # Filter files that need re-encoding
     files_to_reencode = []
     for f in flac_files:
         if not is_flac_1_5_or_newer(f):
@@ -645,14 +789,21 @@ def main(args):
 
     flac_files = files_to_reencode
 
+    if not flac_files and not calc_rsgain:
+        safe_print("No files need processing.")
+        return
+
     error_log = []
     error_count = 0
 
     # Calculate replay gain values and write them to the tags
     if calc_rsgain:
+        safe_print("Calculating replay gain...")
         run_rsgain(directory, thread_count)
 
-    if not test_run:
+    if not test_run and flac_files:
+        safe_print(f"Processing {len(flac_files)} files that need re-encoding...")
+        
         # Encode files 1 at a time with multiple threads
         if multi_threaded:
             flac_version_check()
@@ -696,7 +847,8 @@ def main(args):
                             error_count += 1
                             pbar.set_postfix({"errors": error_count})
                         pbar.update(1)
-    else:
+    elif test_run and flac_files:
+        safe_print(f"Testing {len(flac_files)} files...")
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=thread_count
         ) as executor:
@@ -722,15 +874,22 @@ def main(args):
                         pbar.set_postfix({"errors": error_count})
                     pbar.update(1)
 
-    if log_to_disk:
-        write_log(error_log)
+    # Handle error logging and reporting
+    if error_log:
+        if log_to_disk:
+            write_log(error_log)
+            safe_print(f"Errors logged to {LOG_FILENAME}")
+        else:
+            safe_print("Errors encountered:")
+            for path, error in error_log:
+                safe_print(f"  {path}: {error}")
+    
+    # Final summary
+    if flac_files:
+        percentage = (error_count / len(flac_files)) * 100
+        safe_print(f"\nProcessing complete: {len(flac_files)} files processed, {error_count} errors. Error rate: {percentage:.2f}%")
     else:
-        for path, error in error_log:
-            print(f"Encountered error when processing file:\n{path}\n{error}")
-    percentage = (error_count / len(flac_files)) * 100 if len(flac_files) > 0 else 0
-    print(
-        f"\n{len(flac_files)} flac files processed, {error_count} errors. Error rate: {percentage:.2f} %."
-    )
+        safe_print("\nProcessing complete.")
 
 
 if __name__ == "__main__":
