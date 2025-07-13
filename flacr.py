@@ -410,6 +410,13 @@ def reencode_flac(file_path, thread_count=1):
             try:
                 os.remove(file_path)
                 os.rename(temp_file_path, file_path)
+                # Remove any existing ENCODER tags first, then set the new one
+                subprocess.run(
+                    ["metaflac", "--remove-tag=ENCODER", file_path],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
                 # Set ENCODER tag
                 encoder_str = get_flac_encoder_string()
                 subprocess.run(
