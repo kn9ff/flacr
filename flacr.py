@@ -23,13 +23,14 @@ MIN_RSGAIN_THREADS = 2
 def safe_print(text):
     """
     Print text safely, handling Unicode encoding errors by replacing problematic characters.
+    Also ensure output is flushed immediately for GUI compatibility.
     """
     try:
-        print(text)
+        print(text, flush=True)  # Force immediate flush for GUI
     except UnicodeEncodeError:
         # Replace Unicode characters that can't be encoded in the console's encoding
-        safe_text = text.encode('ascii', 'replace').decode('ascii')
-        print(safe_text)
+        safe_text = text.encode("ascii", "replace").decode("ascii")
+        print(safe_text, flush=True)
 
 
 def validate_dependencies(check_encoder=False, calc_rsgain=False):
@@ -38,16 +39,16 @@ def validate_dependencies(check_encoder=False, calc_rsgain=False):
     Returns a list of missing dependencies.
     """
     missing = []
-    
+
     if not shutil.which("flac"):
         missing.append("flac")
-    
+
     if check_encoder and not shutil.which("metaflac"):
         missing.append("metaflac")
-    
+
     if calc_rsgain and not shutil.which("rsgain"):
         missing.append("rsgain")
-    
+
     return missing
 
 
@@ -166,17 +167,17 @@ def parse_arguments():
 def find_flac_files(directory, single_folder, progress):
     """
     Find all FLAC files in the specified directory.
-    
+
     Args:
         directory: Directory to search
         single_folder: If True, only search current folder, not subdirectories
         progress: Whether to show progress bar
-    
+
     Returns:
         List of absolute paths to FLAC files
     """
     flac_files = []
-    
+
     try:
         safe_print(f"Scanning for FLAC files in: {directory}")
         if not single_folder:
@@ -189,8 +190,16 @@ def find_flac_files(directory, single_folder, progress):
                     # Show current directory being scanned
                     if root != directory:
                         rel_path = os.path.relpath(root, directory)
-                        pbar.set_postfix({"dir": rel_path[:30] + "..." if len(rel_path) > 30 else rel_path})
-                    
+                        pbar.set_postfix(
+                            {
+                                "dir": (
+                                    rel_path[:30] + "..."
+                                    if len(rel_path) > 30
+                                    else rel_path
+                                )
+                            }
+                        )
+
                     for file in files:
                         pbar.update(1)
                         if file.lower().endswith(FLAC_EXTENSION):
@@ -226,7 +235,7 @@ def find_flac_files(directory, single_folder, progress):
     except Exception as e:
         safe_print(f"Error scanning directory {directory}: {e}")
         return []
-    
+
     return flac_files
 
 
@@ -240,11 +249,14 @@ def verify_flac(file_path):
             stderr=subprocess.PIPE,
             text=True,
             check=True,
-            timeout=600  # 10 minute timeout for verification
+            timeout=600,  # 10 minute timeout for verification
         )
         return file_path, result.stderr
     except subprocess.TimeoutExpired:
-        return file_path, f"Verification timeout (10 minutes exceeded) for file: {file_path}"
+        return (
+            file_path,
+            f"Verification timeout (10 minutes exceeded) for file: {file_path}",
+        )
     except subprocess.CalledProcessError as e:
         return file_path, e.stderr
     except Exception as e:
@@ -311,7 +323,7 @@ def get_file_flac_version(file_path):
             stderr=subprocess.PIPE,
             text=True,
             check=True,
-            timeout=30  # 30 second timeout for metadata reading
+            timeout=30,  # 30 second timeout for metadata reading
         )
         # Example output: "reference libFLAC 1.4.2 20221022"
         match = re.search(r"libFLAC (\d+)\.(\d+)\.(\d+)", result.stdout)
@@ -337,7 +349,7 @@ def get_file_encoder_string(file_path):
             stderr=subprocess.PIPE,
             text=True,
             check=True,
-            timeout=30  # 30 second timeout for metadata reading
+            timeout=30,  # 30 second timeout for metadata reading
         )
         return result.stdout.strip() if result.stdout.strip() else None
     except subprocess.TimeoutExpired:
@@ -361,8 +373,8 @@ def get_encoder_metadata_tags(file_path):
         )
         # Output format: "ENCODER=reference libFLAC 1.5.0" (one per line if multiple)
         encoder_tags = []
-        for line in result.stdout.strip().split('\n'):
-            if line.startswith('ENCODER='):
+        for line in result.stdout.strip().split("\n"):
+            if line.startswith("ENCODER="):
                 encoder_tags.append(line[8:])  # Remove "ENCODER=" prefix
         return encoder_tags
     except Exception:
@@ -379,25 +391,27 @@ def check_and_fix_encoder_metadata(file_path, fix_issues=True):
     """
     issues_found = []
     fixed = False
-    
+
     # Get current ENCODER tags
     encoder_tags = get_encoder_metadata_tags(file_path)
-    
+
     # Get the actual encoder string from vendor tag
     file_encoder_string = get_file_encoder_string(file_path)
-    
+
     if not file_encoder_string:
         issues_found.append("No vendor tag found in file")
         return True, issues_found, False
-    
+
     # Check for missing ENCODER tag
     if not encoder_tags:
         issues_found.append("Missing ENCODER metadata tag")
-    
+
     # Check for duplicate ENCODER tags
     elif len(encoder_tags) > 1:
-        issues_found.append(f"Duplicate ENCODER tags found: {len(encoder_tags)} entries")
-    
+        issues_found.append(
+            f"Duplicate ENCODER tags found: {len(encoder_tags)} entries"
+        )
+
     # Check if ENCODER tag matches the vendor string
     elif len(encoder_tags) == 1:
         current_encoder = encoder_tags[0]
@@ -405,8 +419,10 @@ def check_and_fix_encoder_metadata(file_path, fix_issues=True):
             if current_encoder == "reference libFLAC":
                 issues_found.append("ENCODER tag missing version information")
             else:
-                issues_found.append(f"ENCODER tag mismatch: '{current_encoder}' vs vendor '{file_encoder_string}'")
-    
+                issues_found.append(
+                    f"ENCODER tag mismatch: '{current_encoder}' vs vendor '{file_encoder_string}'"
+                )
+
     # Fix issues if requested
     if issues_found and fix_issues:
         try:
@@ -419,7 +435,7 @@ def check_and_fix_encoder_metadata(file_path, fix_issues=True):
                     text=True,
                     check=True,
                 )
-            
+
             # Set the correct ENCODER tag based on vendor string
             subprocess.run(
                 ["metaflac", f"--set-tag=ENCODER={file_encoder_string}", file_path],
@@ -431,7 +447,7 @@ def check_and_fix_encoder_metadata(file_path, fix_issues=True):
             fixed = True
         except Exception as e:
             issues_found.append(f"Failed to fix ENCODER metadata: {e}")
-    
+
     needs_fix = len(issues_found) > 0
     return needs_fix, issues_found, fixed
 
@@ -445,12 +461,14 @@ def is_flac_1_5_or_newer(file_path):
         file_version = get_file_flac_version(file_path)
         if file_version is None:
             # If we can't determine the version, assume it needs re-encoding
-            safe_print(f"Cannot determine FLAC version for {file_path}, will re-encode.")
+            safe_print(
+                f"Cannot determine FLAC version for {file_path}, will re-encode."
+            )
             return False
-        
+
         major, minor, patch = file_version
         is_new_enough = (major > 1) or (major == 1 and minor >= 5)
-        
+
         if is_new_enough:
             # Check if file version matches system version
             system_version = get_system_flac_version()
@@ -459,10 +477,12 @@ def is_flac_1_5_or_newer(file_path):
                     return True
                 else:
                     # File was encoded with a different version, consider re-encoding
-                    safe_print(f"File {file_path} was encoded with libFLAC {'.'.join(map(str, file_version))}, "
-                              f"but system has libFLAC {'.'.join(map(str, system_version))}. Will re-encode for consistency.")
+                    safe_print(
+                        f"File {file_path} was encoded with libFLAC {'.'.join(map(str, file_version))}, "
+                        f"but system has libFLAC {'.'.join(map(str, system_version))}. Will re-encode for consistency."
+                    )
                     return False
-        
+
         return is_new_enough
     except Exception as e:
         safe_print(f"Error checking FLAC version for {file_path}: {e}. Will re-encode.")
@@ -472,11 +492,11 @@ def is_flac_1_5_or_newer(file_path):
 def reencode_flac(file_path, thread_count=1):
     """
     Re-encode a FLAC file with optimal settings.
-    
+
     Args:
         file_path: Path to the FLAC file
         thread_count: Number of threads to use for encoding
-    
+
     Returns:
         Tuple of (file_path, error_message)
     """
@@ -498,11 +518,13 @@ def reencode_flac(file_path, thread_count=1):
             stderr=subprocess.PIPE,
             text=True,
             check=True,
-            timeout=3600  # 1 hour timeout for safety
+            timeout=3600,  # 1 hour timeout for safety
         )
-        
+
         if result.stderr:
-            safe_print(f"Error encountered while re-encoding {file_path}:\n{result.stderr}")
+            safe_print(
+                f"Error encountered while re-encoding {file_path}:\n{result.stderr}"
+            )
             # Clean up temp file on error
             if os.path.exists(temp_file_path):
                 try:
@@ -514,18 +536,21 @@ def reencode_flac(file_path, thread_count=1):
             # Replace the original file with the temporary file
             try:
                 # Verify temp file exists and has content
-                if not os.path.exists(temp_file_path) or os.path.getsize(temp_file_path) == 0:
+                if (
+                    not os.path.exists(temp_file_path)
+                    or os.path.getsize(temp_file_path) == 0
+                ):
                     return file_path, "Temporary file is missing or empty"
-                
+
                 # Create backup of original file permissions
                 original_stat = os.stat(file_path)
-                
+
                 os.remove(file_path)
                 os.rename(temp_file_path, file_path)
-                
+
                 # Restore original permissions
                 os.chmod(file_path, original_stat.st_mode)
-                
+
                 # Remove any existing ENCODER tags first, then set the new one
                 subprocess.run(
                     ["metaflac", "--remove-tag=ENCODER", file_path],
@@ -542,12 +567,18 @@ def reencode_flac(file_path, thread_count=1):
                     text=True,
                 )
             except PermissionError:
-                return file_path, f"File locked. Manual replacement required. Temporary file: {temp_file_path}"
+                return (
+                    file_path,
+                    f"File locked. Manual replacement required. Temporary file: {temp_file_path}",
+                )
             except OSError as e:
-                return file_path, f"File system error: {e}. Temporary file: {temp_file_path}"
-                
+                return (
+                    file_path,
+                    f"File system error: {e}. Temporary file: {temp_file_path}",
+                )
+
         return file_path, ""
-        
+
     except subprocess.TimeoutExpired:
         # Clean up on timeout
         if os.path.exists(temp_file_path):
@@ -577,7 +608,7 @@ def reencode_flac(file_path, thread_count=1):
 def run_rsgain(directory, thread_count):
     """
     Calculate replay gain values using rsgain.
-    
+
     Args:
         directory: Directory to process
         thread_count: Number of threads to use
@@ -585,13 +616,13 @@ def run_rsgain(directory, thread_count):
     # Set rsgain thread count to at least 2 to prevent windows cli limitations
     if thread_count == 1:
         thread_count = MIN_RSGAIN_THREADS
-    
+
     safe_print(f"Starting replay gain calculation with {thread_count} threads...")
     safe_print(f"Scanning directory: {directory}")
-    
+
     # Define the replay gain calculation command
     rs_gain_command = ["rsgain", "easy", "-m", str(thread_count), directory]
-    
+
     try:
         # Start process and show real-time output
         process = subprocess.Popen(
@@ -600,9 +631,9 @@ def run_rsgain(directory, thread_count):
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
-            universal_newlines=True
+            universal_newlines=True,
         )
-        
+
         # Read output line by line to provide feedback
         while True:
             line = process.stdout.readline()
@@ -611,21 +642,21 @@ def run_rsgain(directory, thread_count):
             if line:
                 # Forward rsgain output with prefix for GUI recognition
                 safe_print(f"rsgain: {line.rstrip()}")
-        
+
         # Wait for completion
         process.wait()
-        
+
         if process.returncode == 0:
             safe_print("Replay gain calculation completed successfully.")
         else:
             safe_print(f"rsgain exited with code {process.returncode}")
-            
+
     except subprocess.TimeoutExpired:
         safe_print("rsgain calculation timed out (2 hour limit)")
         sys.exit(1)
     except subprocess.CalledProcessError as e:
         safe_print(f"Error while executing rsgain: {e}")
-        if hasattr(e, 'stderr') and e.stderr:
+        if hasattr(e, "stderr") and e.stderr:
             safe_print(f"rsgain stderr: {e.stderr}")
         sys.exit(1)
     except Exception as e:
@@ -755,7 +786,7 @@ def process_encoder_metadata(flac_files, progress):
     """
     files_with_issues = 0
     files_fixed = 0
-    
+
     with tqdm(
         total=len(flac_files),
         desc="checking encoder metadata",
@@ -764,8 +795,10 @@ def process_encoder_metadata(flac_files, progress):
         ncols=100,
     ) as pbar:
         for flac_file in flac_files:
-            needs_fix, issues, fixed = check_and_fix_encoder_metadata(flac_file, fix_issues=True)
-            
+            needs_fix, issues, fixed = check_and_fix_encoder_metadata(
+                flac_file, fix_issues=True
+            )
+
             if needs_fix:
                 files_with_issues += 1
                 if fixed:
@@ -773,10 +806,10 @@ def process_encoder_metadata(flac_files, progress):
                     safe_print(f"FIXED: {flac_file} - {', '.join(issues)}")
                 else:
                     safe_print(f"ISSUES: {flac_file} - {', '.join(issues)}")
-            
+
             pbar.update(1)
             pbar.set_postfix({"issues": files_with_issues, "fixed": files_fixed})
-    
+
     return files_with_issues, files_fixed
 
 
@@ -784,7 +817,7 @@ def main(args):
     """
     Main function to orchestrate the FLAC processing workflow.
     """
-    args = parse_arguments()
+    # Use the args parameter passed to the function, don't re-parse
     directory = args.directory
     log_to_disk = args.log
     thread_count = int(args.multi_threaded)
@@ -819,28 +852,30 @@ def main(args):
     # Collect paths of all .flac files
     safe_print(f"Scanning directory: {directory}")
     flac_files = find_flac_files(directory, single_folder, progress)
-    
+
     if not flac_files:
         safe_print("No FLAC files found in the specified directory.")
         return
 
     safe_print(f"Found {len(flac_files)} FLAC files.")
-    
+
     # Check and fix ENCODER metadata if requested
     if check_encoder:
         safe_print(f"Checking ENCODER metadata for {len(flac_files)} FLAC files...")
         files_with_issues, files_fixed = process_encoder_metadata(flac_files, progress)
-        safe_print(f"ENCODER metadata check completed: {files_with_issues} files had issues, {files_fixed} were fixed.")
-        
+        safe_print(
+            f"ENCODER metadata check completed: {files_with_issues} files had issues, {files_fixed} were fixed."
+        )
+
         # If only checking encoder metadata, exit here
         if not test_run and not calc_rsgain:
             return
-    
+
     # Filter files that need re-encoding
     safe_print(f"Checking which files need re-encoding...")
     files_to_reencode = []
     skipped_count = 0
-    
+
     with tqdm(
         total=len(flac_files),
         desc="checking files",
@@ -857,8 +892,10 @@ def main(args):
                 skipped_count += 1
                 safe_print(f"Skipping {f}: already encoded with FLAC 1.5.0 or newer.")
             pbar.update(1)
-    
-    safe_print(f"File check complete: {len(files_to_reencode)} files need re-encoding, {skipped_count} files skipped.")
+
+    safe_print(
+        f"File check complete: {len(files_to_reencode)} files need re-encoding, {skipped_count} files skipped."
+    )
     flac_files = files_to_reencode
 
     if not flac_files and not calc_rsgain:
@@ -875,7 +912,7 @@ def main(args):
 
     if not test_run and flac_files:
         safe_print(f"Processing {len(flac_files)} files that need re-encoding...")
-        
+
         # Encode files 1 at a time with multiple threads
         if multi_threaded:
             flac_version_check()
@@ -894,7 +931,12 @@ def main(args):
                         error_log.append((filepath, stderr))
                         error_count += 1
                         safe_print(f"Error processing {filepath}: {stderr}")
-                        pbar.set_postfix({"errors": error_count, "current": os.path.basename(flac_file)})
+                        pbar.set_postfix(
+                            {
+                                "errors": error_count,
+                                "current": os.path.basename(flac_file),
+                            }
+                        )
                     else:
                         safe_print(f"Successfully processed: {filepath}")
                     pbar.update(1)
@@ -968,11 +1010,13 @@ def main(args):
             safe_print("Errors encountered:")
             for path, error in error_log:
                 safe_print(f"  {path}: {error}")
-    
+
     # Final summary
     if flac_files:
         percentage = (error_count / len(flac_files)) * 100
-        safe_print(f"\nProcessing complete: {len(flac_files)} files processed, {error_count} errors. Error rate: {percentage:.2f}%")
+        safe_print(
+            f"\nProcessing complete: {len(flac_files)} files processed, {error_count} errors. Error rate: {percentage:.2f}%"
+        )
     else:
         safe_print("\nProcessing complete.")
 
