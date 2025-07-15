@@ -10,6 +10,8 @@ import shutil
 import configparser
 import re
 import time
+import queue
+from io import StringIO
 
 SCRIPT_PATH = os.path.join(os.path.dirname(__file__), 'flacr.py')
 CONFIG_PATH = os.path.join(os.path.expanduser('~'), '.flacr_gui.ini')
@@ -29,6 +31,7 @@ class FlacrGUI(tk.Tk):
         self.geometry('700x650')
         self.minsize(600, 500)
         self.process = None  # Track running process for cancellation
+        self.process_active = False  # Flag to control process threads
         self.max_log_lines = 1000  # Auto-truncate after this many lines
         self.create_widgets()
         self.load_settings()
@@ -164,6 +167,7 @@ class FlacrGUI(tk.Tk):
         if self.process and self.process.poll() is None:
             try:
                 self.append_output('\n[CANCELLED BY USER]\n', tag='error')
+                self.process_active = False  # Signal threads to stop
                 self._terminate_process_safely()
             except Exception as e:
                 self.append_output(f'Error during cancellation: {e}\n', tag='error')
@@ -220,142 +224,193 @@ class FlacrGUI(tk.Tk):
 
     def _run_flacr_thread(self, args):
         try:
-            # Use creationflags on Windows to prevent console window and handle process groups properly
+            # Use a more robust subprocess approach for Windows
+            self.output_queue = queue.Queue()
+            self.process_active = True
+            
+            # Configure subprocess for Windows
             creation_flags = 0
             if sys.platform == "win32":
-                creation_flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+                creation_flags = subprocess.CREATE_NO_WINDOW
             
+            # Start the subprocess with minimal buffering
             self.process = subprocess.Popen(
-                args, 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.STDOUT, 
-                text=True, 
-                bufsize=1,
-                creationflags=creation_flags
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=0,  # No buffering to prevent memory issues
+                creationflags=creation_flags,
+                universal_newlines=True
             )
             
+            # Start output reading thread
+            output_thread = threading.Thread(
+                target=self._read_process_output,
+                daemon=True
+            )
+            output_thread.start()
+            
+            # Process output from queue
             total_files = None
             processed = 0
             current_file = ''
             last_output_time = time.time()
             last_progress_time = time.time()
             
-            # More reasonable timeouts for different operations
-            no_output_timeout = 600  # 10 minutes for no output at all
-            progress_timeout = 1800  # 30 minutes for no file progress
+            # Timeout settings
+            no_output_timeout = 600  # 10 minutes for no output
+            progress_timeout = 1800  # 30 minutes for no progress
             
-            # Read output line by line until process completes
-            while True:
+            while self.process_active:
                 try:
-                    # Check if process has finished
-                    if self.process.poll() is not None:
+                    # Check if process finished
+                    if self.process and self.process.poll() is not None:
+                        self.process_active = False
                         break
                     
-                    # Try to read a line (this can block on Windows)
+                    # Get output from queue with timeout
                     try:
-                        # Use a smaller buffer and non-blocking approach
-                        line = self.process.stdout.readline()
-                    except Exception as read_error:
-                        self.append_output(f'Error reading from subprocess: {read_error}\n', tag='error')
-                        time.sleep(0.5)
-                        continue
-                    
-                    current_time = time.time()
-                    
-                    if line:
+                        line = self.output_queue.get(timeout=0.5)
+                        if line is None:  # End of output signal
+                            break
+                            
+                        current_time = time.time()
                         last_output_time = current_time
+                        
+                        # Process the line
                         self.append_output(line)
                         
-                        # Extract total files from summary lines if not already set
+                        # Extract total files count
                         if total_files is None:
                             summary_match = re.search(r'(\d+) flac files', line)
                             if summary_match:
                                 total_files = int(summary_match.group(1))
                                 self.progress['maximum'] = total_files
-
-                        # Update progress based on processed files
-                        file_line = re.search(r'(Processing|Verifying|Encoding|Checking|Successfully):\s*(.+\.flac)', line, re.IGNORECASE)
-                        if file_line:
-                            processed += 1
-                            current_file = file_line.group(2).strip()
-                            last_progress_time = current_time
-                            self.update_progress(processed, total_files or processed, current_file)
                         
-                        # Also detect when files are being skipped
-                        skip_line = re.search(r'(Skipping|already encoded).*?(.+\.flac)', line, re.IGNORECASE)
-                        if skip_line:
-                            current_file = skip_line.group(2).strip() if skip_line.group(2) else "unknown file"
-                            last_progress_time = current_time
-                            self.update_progress(processed, total_files or processed, current_file)
-                    else:
-                        # No output available, small delay to prevent busy waiting
-                        time.sleep(0.1)
+                        # Track progress
+                        file_patterns = [
+                            r'(Processing|Verifying|Encoding|Checking|Successfully):\s*(.+\.flac)',
+                            r'(Skipping|already encoded).*?([^\\/:*?"<>|]+\.flac)',
+                            r'Will re-encode:\s*(.+\.flac)'
+                        ]
                         
-                        # Check for timeouts
-                        time_since_output = current_time - last_output_time
-                        time_since_progress = current_time - last_progress_time
+                        for pattern in file_patterns:
+                            match = re.search(pattern, line, re.IGNORECASE)
+                            if match:
+                                if len(match.groups()) >= 2:
+                                    current_file = match.group(2).strip()
+                                else:
+                                    current_file = match.group(1).strip()
+                                
+                                processed += 1
+                                last_progress_time = current_time
+                                self.update_progress(processed, total_files or processed, current_file)
+                                break
                         
-                        # If no output for a very long time, terminate
-                        if time_since_output > no_output_timeout:
-                            self.append_output(f'\n[TIMEOUT] No output for {no_output_timeout//60} minutes. Process appears hung.\n', tag='error')
-                            self.append_output(f'[TIMEOUT] Last file being processed: {current_file}\n', tag='error')
+                    except queue.Empty:
+                        # No output available, check timeouts
+                        current_time = time.time()
+                        
+                        if current_time - last_output_time > no_output_timeout:
+                            self.append_output(f'\n[TIMEOUT] No output for {no_output_timeout//60} minutes.\n', tag='error')
                             self._terminate_process_safely()
                             break
                         
-                        # If no file progress for a long time, but still getting output, warn but continue
-                        elif time_since_progress > progress_timeout:
-                            self.append_output(f'\n[WARNING] No file progress for {progress_timeout//60} minutes on: {current_file}\n', tag='warn')
-                            self.append_output('[WARNING] File may be very large or corrupted. Continuing to wait...\n', tag='warn')
-                            last_progress_time = current_time  # Reset warning timer
+                        if current_time - last_progress_time > progress_timeout:
+                            self.append_output(f'\n[WARNING] No progress for {progress_timeout//60} minutes on: {current_file}\n', tag='warn')
+                            last_progress_time = current_time
                         
+                        # Update GUI to keep it responsive
+                        self.update_idletasks()
+                
                 except Exception as e:
-                    self.append_output(f'Error in processing loop: {e}\n', tag='error')
-                    time.sleep(0.5)  # Brief pause before retrying
-
-            # Read any remaining output
-            self._read_remaining_output()
-
-            # Wait for process to complete with reasonable timeout
-            try:
-                self.process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                self.append_output('[TIMEOUT] Process did not exit cleanly, forcing termination\n', tag='error')
-                self._terminate_process_safely()
-
-            # Handle final status
-            self._handle_process_completion(total_files, processed, current_file)
+                    self.append_output(f'Error processing output: {e}\n', tag='error')
+                    break
+            
+            # Wait for process to complete
+            if self.process:
+                try:
+                    self.process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self._terminate_process_safely()
+                
+                # Handle completion status
+                self._handle_process_completion(total_files, processed, current_file)
             
         except Exception as e:
+            self.append_output(f'Critical error in process thread: {e}\n', tag='error')
             self.progress_label.config(text='Error occurred')
-            self.append_output(f'Unexpected error in thread: {e}\n', tag='error')
         finally:
+            self.process_active = False
             self.run_button.config(state='normal')
             self.cancel_button.config(state='disabled')
+            if hasattr(self, 'process') and self.process:
+                try:
+                    if self.process.poll() is None:
+                        self.process.terminate()
+                except:
+                    pass
             self.process = None
+
+    def _read_process_output(self):
+        """Read process output in a separate thread to prevent blocking"""
+        try:
+            if not self.process or not self.process.stdout:
+                return
+            
+            while self.process_active and self.process.poll() is None:
+                try:
+                    line = self.process.stdout.readline()
+                    if line:
+                        self.output_queue.put(line)
+                    else:
+                        # End of stream
+                        break
+                except Exception as e:
+                    self.output_queue.put(f"Error reading output: {e}\n")
+                    break
+            
+            # Read any remaining output
+            try:
+                remaining = self.process.stdout.read()
+                if remaining:
+                    for line in remaining.splitlines(keepends=True):
+                        self.output_queue.put(line)
+            except:
+                pass
+            
+            # Signal end of output
+            self.output_queue.put(None)
+            
+        except Exception as e:
+            self.output_queue.put(f"Output thread error: {e}\n")
+            self.output_queue.put(None)
 
     def _terminate_process_safely(self):
         """Safely terminate the process using Windows-appropriate methods"""
         if not self.process or self.process.poll() is not None:
             return
         
+        self.process_active = False  # Signal threads to stop
+        
         try:
             if sys.platform == "win32":
-                # On Windows, try CTRL+C first, then terminate
+                # On Windows, try terminate first
+                self.process.terminate()
+                self.append_output('[TERMINATING] Sending terminate signal...\n', tag='warn')
+                
+                # Wait a bit for graceful termination
                 try:
-                    self.process.send_signal(signal.CTRL_C_EVENT)
-                    self.append_output('[TERMINATING] Sending CTRL+C signal...\n', tag='warn')
-                    time.sleep(3)
-                except Exception:
-                    pass  # CTRL+C might not work, continue to terminate
-                
-                if self.process.poll() is None:
-                    self.process.terminate()
-                    self.append_output('[TERMINATING] Sending terminate signal...\n', tag='warn')
-                    time.sleep(2)
-                
-                if self.process.poll() is None:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    # Force kill if it doesn't terminate gracefully
                     self.process.kill()
                     self.append_output('[FORCE KILLED] Process force-killed\n', tag='error')
+                    try:
+                        self.process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        pass  # Process might be zombie now
             else:
                 # Unix-like systems
                 self.process.terminate()
@@ -364,18 +419,18 @@ class FlacrGUI(tk.Tk):
                     self.process.kill()
         except Exception as e:
             self.append_output(f'Error during process termination: {e}\n', tag='error')
+        finally:
+            # Ensure process handle is cleaned up
+            try:
+                if self.process and self.process.poll() is None:
+                    self.process.kill()
+            except:
+                pass
 
     def _read_remaining_output(self):
-        """Read any remaining output from the process"""
-        try:
-            # Set a short timeout for reading remaining output
-            if self.process and self.process.stdout:
-                remaining_output = self.process.stdout.read()
-                if remaining_output and remaining_output.strip():
-                    self.append_output(remaining_output)
-        except Exception as e:
-            # Don't log this error as it's common when process is terminated
-            pass
+        """Read any remaining output from the process - simplified for new approach"""
+        # With the queue-based approach, this is handled by the output thread
+        pass
 
     def _handle_process_completion(self, total_files, processed, current_file):
         """Handle the final process completion status"""
@@ -399,41 +454,57 @@ class FlacrGUI(tk.Tk):
             self.append_output(f'Process exited with code {returncode}.\n', tag='error')
 
     def append_output(self, text, tag=None):
-        self.output_text.config(state='normal')
-        
-        # Auto-truncate log if it gets too long
-        current_lines = int(self.output_text.index('end-1c').split('.')[0])
-        if current_lines > self.max_log_lines:
-            # Remove first 200 lines to prevent constant truncation
-            self.output_text.delete('1.0', '201.0')
-            self.output_text.insert('1.0', '[... earlier output truncated ...]\n', 'warn')
-        
-        # Highlight errors/warnings/skipped
-        if tag is None:
-            if text.startswith('SKIPPED_FLAC:'):
-                tag = 'skipped'
-            elif re.search(r'error|failed|exception|not on PATH|locked|manual replacement', text, re.IGNORECASE):
-                tag = 'error'
-            elif re.search(r'warn|skipping|cannot|missing', text, re.IGNORECASE):
-                tag = 'warn'
-        self.output_text.insert(tk.END, text, tag)
-        self.output_text.see(tk.END)
-        self.output_text.config(state='disabled')
+        # Schedule GUI update in main thread to prevent memory corruption
+        self.after_idle(self._append_output_safe, text, tag)
+
+    def _append_output_safe(self, text, tag=None):
+        try:
+            self.output_text.config(state='normal')
+            
+            # Auto-truncate log if it gets too long
+            current_lines = int(self.output_text.index('end-1c').split('.')[0])
+            if current_lines > self.max_log_lines:
+                # Remove first 200 lines to prevent constant truncation
+                self.output_text.delete('1.0', '201.0')
+                self.output_text.insert('1.0', '[... earlier output truncated ...]\n', 'warn')
+            
+            # Highlight errors/warnings/skipped
+            if tag is None:
+                if text.startswith('SKIPPED_FLAC:'):
+                    tag = 'skipped'
+                elif re.search(r'error|failed|exception|not on PATH|locked|manual replacement', text, re.IGNORECASE):
+                    tag = 'error'
+                elif re.search(r'warn|skipping|cannot|missing', text, re.IGNORECASE):
+                    tag = 'warn'
+            
+            self.output_text.insert(tk.END, text, tag)
+            self.output_text.see(tk.END)
+            self.output_text.config(state='disabled')
+        except Exception as e:
+            # Fallback: just print to console if GUI update fails
+            print(f"GUI update error: {e}")
+            print(f"Text: {text}")
 
     def update_progress(self, value, maximum, current_file=None):
-        self.progress['maximum'] = maximum
-        self.progress['value'] = value
-        
-        if current_file:
-            display_file = os.path.basename(current_file)
-            percentage = (value / maximum * 100) if maximum > 0 else 0
-            self.progress_label.config(text=f'Processing: {display_file}   ({value}/{maximum} - {percentage:.1f}%)')
-        elif maximum > 0:
-            percentage = (value / maximum * 100)
-            self.progress_label.config(text=f'Progress: {value}/{maximum} files ({percentage:.1f}%)')
-        else:
-            self.progress_label.config(text=f'Processing... ({value} files)')
-        self.update_idletasks()
+        # Schedule progress update in main thread
+        self.after_idle(self._update_progress_safe, value, maximum, current_file)
+
+    def _update_progress_safe(self, value, maximum, current_file=None):
+        try:
+            self.progress['maximum'] = maximum
+            self.progress['value'] = value
+            
+            if current_file:
+                display_file = os.path.basename(current_file)
+                percentage = (value / maximum * 100) if maximum > 0 else 0
+                self.progress_label.config(text=f'Processing: {display_file}   ({value}/{maximum} - {percentage:.1f}%)')
+            elif maximum > 0:
+                percentage = (value / maximum * 100)
+                self.progress_label.config(text=f'Progress: {value}/{maximum} files ({percentage:.1f}%)')
+            else:
+                self.progress_label.config(text=f'Processing... ({value} files)')
+        except Exception as e:
+            print(f"Progress update error: {e}")
 
     def check_dependencies(self):
         missing = []
@@ -582,6 +653,18 @@ class FlacrGUI(tk.Tk):
                 self.update_option_states()
 
     def on_close(self):
+        # Ensure any running process is properly terminated
+        if hasattr(self, 'process') and self.process and self.process.poll() is None:
+            try:
+                self.process_active = False
+                self.process.terminate()
+                # Give it a moment to terminate
+                time.sleep(1)
+                if self.process.poll() is None:
+                    self.process.kill()
+            except Exception:
+                pass  # Ignore errors during cleanup
+        
         self.save_settings()
         self.destroy()
 
