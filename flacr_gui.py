@@ -726,7 +726,7 @@ class FlacrGUI(tk.Tk):
             logger.info(f"Thread args: {args}")
 
             # Initialize queue and process state
-            self.output_queue = queue.Queue(maxsize=1000)  # Prevent memory issues
+            self.output_queue = queue.Queue(maxsize=5000)  # Increase queue size for better handling
             self.process_active = True
 
             # Configure subprocess creation
@@ -810,6 +810,7 @@ class FlacrGUI(tk.Tk):
         current_file = ""
         last_output_time = time.time()
         last_progress_time = time.time()
+        last_gui_update = time.time()
         current_operation = "Starting"
 
         # Dynamic timeout settings
@@ -824,6 +825,7 @@ class FlacrGUI(tk.Tk):
 
         consecutive_errors = 0
         max_consecutive_errors = 5
+        gui_update_interval = 0.1  # Update GUI max every 100ms
 
         while self.process_active:
             try:
@@ -833,30 +835,63 @@ class FlacrGUI(tk.Tk):
                     self.process_active = False
                     break
 
-                # Get output with timeout
+                # Get output with timeout - process multiple lines if available
+                lines_to_process = []
                 try:
+                    # Get first line with timeout
                     line = self.output_queue.get(timeout=0.5)
                     if line is None:  # End of output signal
                         break
+                    lines_to_process.append(line)
+                    
+                    # Get additional lines without blocking (batch processing)
+                    while len(lines_to_process) < 50:  # Limit batch size
+                        try:
+                            line = self.output_queue.get_nowait()
+                            if line is None:  # End of output signal
+                                break
+                            lines_to_process.append(line)
+                        except queue.Empty:
+                            break
+
+                    # Emergency queue drain if it's getting too full
+                    if self.output_queue.qsize() > 4000:  # 80% of max capacity
+                        logger.warning(f"Queue very full ({self.output_queue.qsize()}), draining excess")
+                        drained = 0
+                        while self.output_queue.qsize() > 2000 and drained < 1000:
+                            try:
+                                self.output_queue.get_nowait()
+                                drained += 1
+                            except queue.Empty:
+                                break
+                        logger.warning(f"Drained {drained} excess queue items")
 
                     consecutive_errors = 0  # Reset error counter on successful read
                     current_time = time.time()
                     last_output_time = current_time
 
-                    # Process the output line
-                    result = self._process_output_line(
-                        line, current_time, last_progress_time
-                    )
-                    if result:
-                        operation, file_info, progress_info = result
-                        if operation:
-                            current_operation = operation
-                            last_progress_time = current_time
-                        if file_info:
-                            current_file, processed = file_info
-                            last_progress_time = current_time
-                        if progress_info:
-                            total_files = progress_info
+                    # Process all lines in batch
+                    for line in lines_to_process:
+                        if line is None:
+                            break
+                        result = self._process_output_line(
+                            line, current_time, last_progress_time
+                        )
+                        if result:
+                            operation, file_info, progress_info = result
+                            if operation:
+                                current_operation = operation
+                                last_progress_time = current_time
+                            if file_info:
+                                current_file, processed = file_info
+                                last_progress_time = current_time
+                            if progress_info:
+                                total_files = progress_info
+                    
+                    # Rate-limited GUI updates to prevent overwhelming tkinter
+                    if current_time - last_gui_update >= gui_update_interval:
+                        self.after_idle(lambda: None)  # Force GUI refresh
+                        last_gui_update = current_time
 
                 except queue.Empty:
                     # Handle timeout conditions
@@ -893,8 +928,12 @@ class FlacrGUI(tk.Tk):
     def _process_output_line(self, line, current_time, last_progress_time):
         """Process a single output line and extract information"""
         try:
-            logger.debug(f"Processing output line: {line.strip()}")
-            self.append_output(line)
+            # Only append output for important lines, not every single line
+            # to prevent GUI update overload
+            important_line = self._is_important_output_line(line)
+            if important_line:
+                logger.debug(f"Processing important output line: {line.strip()}")
+                self.append_output(line)
 
             # Detect current operation
             operation = self._detect_current_operation(line)
@@ -946,6 +985,49 @@ class FlacrGUI(tk.Tk):
         except Exception as e:
             logger.error(f"Error processing output line: {e}")
             return None
+
+    def _is_important_output_line(self, line):
+        """Determine if this output line should be shown in GUI to reduce spam"""
+        line_lower = line.lower().strip()
+        
+        # Always show these important line types
+        important_patterns = [
+            # Progress and status messages
+            r'scanning|found \d+ flac files|processing|completed',
+            # File operations
+            r'encoding|verifying|checking|transcoding',
+            # Errors and warnings
+            r'error|warning|failed|problem',
+            # Summary information
+            r'total|summary|finished|done',
+            # Replay gain operations
+            r'rsgain|replay gain|calculating gain',
+            # Important file mentions (not every progress line)
+            r'\.flac.*->.*\.flac',
+        ]
+        
+        # Skip verbose progress indicators and repeated messages
+        skip_patterns = [
+            r'^\s*\d+%\s*$',  # Just percentage numbers
+            r'^\s*\|\s*[▉▊▋▌▍▎▏\s]*\|\s*\d+%',  # Progress bars
+            r'^\s*[\.]{3,}',  # Multiple dots
+            r'reading.*metadata',  # Verbose metadata reading
+        ]
+        
+        # Check if we should skip this line
+        for pattern in skip_patterns:
+            if re.search(pattern, line_lower):
+                return False
+        
+        # Check if this is an important line
+        for pattern in important_patterns:
+            if re.search(pattern, line_lower):
+                return True
+        
+        # For debugging, show some lines but not all
+        # Show every 50th line of unmatched content
+        import random
+        return random.randint(1, 50) == 1
 
     def _handle_timeout(
         self,
@@ -1028,6 +1110,7 @@ class FlacrGUI(tk.Tk):
             buffer_size = 8192  # Larger buffer for efficiency
             partial_line = ""
             lines_read = 0
+            dropped_lines = 0  # Track dropped lines to reduce log spam
 
             try:
                 for line in iter(self.process.stdout.readline, ""):
@@ -1037,19 +1120,27 @@ class FlacrGUI(tk.Tk):
 
                     try:
                         lines_read += 1
-                        logger.debug(f"Read line {lines_read}: {line.strip()}")
+                        # Reduce debug logging frequency to prevent spam
+                        if lines_read % 100 == 0:
+                            logger.debug(f"Read {lines_read} lines so far")
                         
                         # Handle partial lines properly
                         if line.endswith("\n"):
                             full_line = partial_line + line
                             partial_line = ""
 
-                            # Put line in queue with size check
-                            if self.output_queue.qsize() < 950:  # Leave some headroom
-                                self.output_queue.put(full_line)
-                                logger.debug(f"Put line in queue: {full_line.strip()}")
-                            else:
-                                logger.warning("Output queue full, dropping line")
+                            # Put line in queue with size check - batch processing approach
+                            try:
+                                self.output_queue.put_nowait(full_line)
+                                # Only log every 100th successful line to reduce spam
+                                if lines_read % 100 == 0:
+                                    logger.debug(f"Put line {lines_read} in queue")
+                            except queue.Full:
+                                # Drop line silently when queue is full to prevent log spam
+                                # Only log every 100th dropped line
+                                dropped_lines += 1
+                                if dropped_lines % 100 == 0:
+                                    logger.warning(f"Output queue full, dropped {dropped_lines} lines")
                         else:
                             partial_line += line
 
@@ -1059,10 +1150,10 @@ class FlacrGUI(tk.Tk):
                 # Handle any remaining partial line
                 if partial_line:
                     try:
-                        self.output_queue.put(partial_line + "\n")
-                        logger.debug(f"Put final partial line in queue: {partial_line}")
-                    except:
-                        pass
+                        self.output_queue.put_nowait(partial_line + "\n")
+                        logger.debug(f"Put final partial line in queue")
+                    except queue.Full:
+                        logger.warning("Queue full, dropped final partial line")
 
                 logger.info(f"Finished reading process output. Total lines read: {lines_read}")
 
@@ -1452,8 +1543,15 @@ class FlacrGUI(tk.Tk):
                 pass
 
     def update_progress(self, value, maximum, current_file=None, status_text=None):
-        """Schedule progress update in main thread with error handling"""
+        """Schedule progress update in main thread with error handling and throttling"""
         try:
+            # Throttle progress updates to prevent GUI overload
+            current_time = time.time()
+            if hasattr(self, '_last_progress_update'):
+                if current_time - self._last_progress_update < 0.2:  # Max 5 updates per second
+                    return
+            self._last_progress_update = current_time
+            
             self.after_idle(
                 self._update_progress_safe, value, maximum, current_file, status_text
             )
