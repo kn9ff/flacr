@@ -178,31 +178,48 @@ def find_flac_files(directory, single_folder, progress):
     flac_files = []
     
     try:
+        safe_print(f"Scanning for FLAC files in: {directory}")
         if not single_folder:
+            safe_print("Scanning subdirectories recursively...")
             with tqdm(
-                desc="searching", unit=" files", disable=not progress, ncols=100
+                desc="scanning", unit=" files", disable=not progress, ncols=100
             ) as pbar:
                 flac_count = 0
                 for root, dirs, files in os.walk(directory):
+                    # Show current directory being scanned
+                    if root != directory:
+                        rel_path = os.path.relpath(root, directory)
+                        pbar.set_postfix({"dir": rel_path[:30] + "..." if len(rel_path) > 30 else rel_path})
+                    
                     for file in files:
                         pbar.update(1)
                         if file.lower().endswith(FLAC_EXTENSION):
-                            flac_files.append(os.path.join(os.path.abspath(root), file))
+                            full_path = os.path.join(os.path.abspath(root), file)
+                            flac_files.append(full_path)
                             flac_count += 1
-                            pbar.set_postfix({"flac files": flac_count})
+                            pbar.set_postfix({"flac files found": flac_count})
+                            # Occasional output for GUI
+                            if flac_count % 50 == 0:
+                                safe_print(f"Found {flac_count} FLAC files so far...")
         else:
+            safe_print("Scanning current folder only...")
             with tqdm(
-                desc="searching", unit=" files", disable=not progress, ncols=100
+                desc="scanning", unit=" files", disable=not progress, ncols=100
             ) as pbar:
                 flac_count = 0
-                for file in os.listdir(directory):
-                    if file.lower().endswith(FLAC_EXTENSION):
-                        file_path = os.path.join(os.path.abspath(directory), file)
-                        if os.path.isfile(file_path):  # Ensure it's actually a file
-                            flac_files.append(file_path)
-                            flac_count += 1
-                            pbar.set_postfix({"flac files": flac_count})
+                try:
+                    files = os.listdir(directory)
+                    for file in files:
                         pbar.update(1)
+                        if file.lower().endswith(FLAC_EXTENSION):
+                            file_path = os.path.join(os.path.abspath(directory), file)
+                            if os.path.isfile(file_path):  # Ensure it's actually a file
+                                flac_files.append(file_path)
+                                flac_count += 1
+                                pbar.set_postfix({"flac files found": flac_count})
+                except OSError as e:
+                    safe_print(f"Error listing directory contents: {e}")
+                    return []
     except PermissionError as e:
         safe_print(f"Permission denied accessing directory {directory}: {e}")
         return []
@@ -568,26 +585,47 @@ def run_rsgain(directory, thread_count):
     # Set rsgain thread count to at least 2 to prevent windows cli limitations
     if thread_count == 1:
         thread_count = MIN_RSGAIN_THREADS
-        
+    
+    safe_print(f"Starting replay gain calculation with {thread_count} threads...")
+    safe_print(f"Scanning directory: {directory}")
+    
     # Define the replay gain calculation command
     rs_gain_command = ["rsgain", "easy", "-m", str(thread_count), directory]
     
     try:
-        result = subprocess.run(
-            rs_gain_command, 
-            check=True,
-            capture_output=True,
+        # Start process and show real-time output
+        process = subprocess.Popen(
+            rs_gain_command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            timeout=7200  # 2 hour timeout for large directories
+            bufsize=1,
+            universal_newlines=True
         )
-        if result.stdout:
-            safe_print(f"rsgain output: {result.stdout}")
+        
+        # Read output line by line to provide feedback
+        while True:
+            line = process.stdout.readline()
+            if not line and process.poll() is not None:
+                break
+            if line:
+                # Forward rsgain output with prefix for GUI recognition
+                safe_print(f"rsgain: {line.rstrip()}")
+        
+        # Wait for completion
+        process.wait()
+        
+        if process.returncode == 0:
+            safe_print("Replay gain calculation completed successfully.")
+        else:
+            safe_print(f"rsgain exited with code {process.returncode}")
+            
     except subprocess.TimeoutExpired:
         safe_print("rsgain calculation timed out (2 hour limit)")
         sys.exit(1)
     except subprocess.CalledProcessError as e:
         safe_print(f"Error while executing rsgain: {e}")
-        if e.stderr:
+        if hasattr(e, 'stderr') and e.stderr:
             safe_print(f"rsgain stderr: {e.stderr}")
         sys.exit(1)
     except Exception as e:

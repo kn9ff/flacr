@@ -13,6 +13,13 @@ import time
 import queue
 from io import StringIO
 
+# Import fcntl for Unix systems only
+try:
+    import fcntl
+    HAS_FCNTL = True
+except ImportError:
+    HAS_FCNTL = False
+
 SCRIPT_PATH = os.path.join(os.path.dirname(__file__), 'flacr.py')
 CONFIG_PATH = os.path.join(os.path.expanduser('~'), '.flacr_gui.ini')
 ERROR_LOG_PATH = os.path.join(os.path.dirname(__file__), 'flacr_error.log')
@@ -155,7 +162,7 @@ class FlacrGUI(tk.Tk):
         self.output_text.config(state='normal')
         self.output_text.delete(1.0, tk.END)
         self.output_text.insert(tk.END, 'Running flacr...\n', 'bold')
-        self.output_text.insert(tk.END, 'Note: Process will timeout after 10 minutes of no output, or 30 minutes of no file progress.\n', 'warn')
+        self.output_text.insert(tk.END, 'Note: Timeouts are dynamic based on operation (5min-2hrs). GUI shows real-time status.\n', 'warn')
         self.output_text.config(state='disabled')
         self.progress['value'] = 0
         self.progress_label.config(text='Starting...')
@@ -257,10 +264,18 @@ class FlacrGUI(tk.Tk):
             current_file = ''
             last_output_time = time.time()
             last_progress_time = time.time()
+            current_operation = "Starting"
             
-            # Timeout settings
-            no_output_timeout = 600  # 10 minutes for no output
-            progress_timeout = 1800  # 30 minutes for no progress
+            # Dynamic timeout settings based on operation
+            base_timeout = 300  # 5 minutes base timeout
+            operation_timeouts = {
+                'scanning': 600,      # 10 minutes for scanning large directories
+                'checking': 1800,     # 30 minutes for checking files (metadata operations can be slow)
+                'encoding': 3600,     # 1 hour for encoding (large files take time)
+                'verifying': 1800,    # 30 minutes for verification
+                'rsgain': 7200,       # 2 hours for replay gain calculation
+                'default': 600        # 10 minutes default
+            }
             
             while self.process_active:
                 try:
@@ -281,45 +296,73 @@ class FlacrGUI(tk.Tk):
                         # Process the line
                         self.append_output(line)
                         
+                        # Detect current operation and update status
+                        operation_detected = self._detect_current_operation(line)
+                        if operation_detected:
+                            current_operation = operation_detected
+                            last_progress_time = current_time  # Reset progress timeout on operation change
+                        
                         # Extract total files count
                         if total_files is None:
                             summary_match = re.search(r'(\d+) flac files', line)
                             if summary_match:
                                 total_files = int(summary_match.group(1))
                                 self.progress['maximum'] = total_files
+                                self.progress_label.config(text=f'Found {total_files} FLAC files')
                         
-                        # Track progress
-                        file_patterns = [
-                            r'(Processing|Verifying|Encoding|Checking|Successfully):\s*(.+\.flac)',
-                            r'(Skipping|already encoded).*?([^\\/:*?"<>|]+\.flac)',
-                            r'Will re-encode:\s*(.+\.flac)'
-                        ]
-                        
-                        for pattern in file_patterns:
-                            match = re.search(pattern, line, re.IGNORECASE)
-                            if match:
-                                if len(match.groups()) >= 2:
-                                    current_file = match.group(2).strip()
-                                else:
-                                    current_file = match.group(1).strip()
-                                
+                        # Track file progress with comprehensive patterns
+                        file_info = self._extract_file_info(line)
+                        if file_info:
+                            file_path, operation_type = file_info
+                            current_file = file_path
+                            
+                            # Only increment for actual processing operations
+                            if operation_type in ['processing', 'encoding', 'verifying']:
                                 processed += 1
-                                last_progress_time = current_time
-                                self.update_progress(processed, total_files or processed, current_file)
-                                break
+                            
+                            last_progress_time = current_time
+                            status_text = f'{operation_type.title()}: {os.path.basename(current_file)}'
+                            self.update_progress(processed, total_files or processed, current_file, status_text)
+                        
+                        # Handle rsgain output specially
+                        if self._is_rsgain_output(line):
+                            current_operation = "rsgain"
+                            last_progress_time = current_time
+                            rsgain_status = self._parse_rsgain_output(line)
+                            if rsgain_status:
+                                self.progress_label.config(text=f'Replay Gain: {rsgain_status}')
                         
                     except queue.Empty:
                         # No output available, check timeouts
                         current_time = time.time()
                         
-                        if current_time - last_output_time > no_output_timeout:
-                            self.append_output(f'\n[TIMEOUT] No output for {no_output_timeout//60} minutes.\n', tag='error')
+                        # Get appropriate timeout for current operation
+                        current_timeout = operation_timeouts.get(current_operation.lower(), operation_timeouts['default'])
+                        
+                        time_since_output = current_time - last_output_time
+                        time_since_progress = current_time - last_progress_time
+                        
+                        # Show what we're waiting for
+                        if time_since_output > 30:  # After 30 seconds of no output
+                            waiting_text = f'Waiting for {current_operation}'
+                            if current_file:
+                                waiting_text += f' on {os.path.basename(current_file)}'
+                            self.progress_label.config(text=waiting_text + f' ({int(time_since_output)}s)')
+                        
+                        # Timeout based on current operation
+                        if time_since_output > current_timeout:
+                            self.append_output(f'\n[TIMEOUT] No output for {current_timeout//60} minutes during {current_operation}.\n', tag='error')
+                            if current_file:
+                                self.append_output(f'[TIMEOUT] Last file: {current_file}\n', tag='error')
                             self._terminate_process_safely()
                             break
                         
-                        if current_time - last_progress_time > progress_timeout:
-                            self.append_output(f'\n[WARNING] No progress for {progress_timeout//60} minutes on: {current_file}\n', tag='warn')
-                            last_progress_time = current_time
+                        # Progress timeout warning (longer than output timeout)
+                        if time_since_progress > current_timeout * 2:
+                            self.append_output(f'\n[WARNING] No progress for {(current_timeout*2)//60} minutes on {current_operation}\n', tag='warn')
+                            if current_file:
+                                self.append_output(f'[WARNING] Current file: {current_file}\n', tag='warn')
+                            last_progress_time = current_time  # Reset warning timer
                         
                         # Update GUI to keep it responsive
                         self.update_idletasks()
@@ -354,38 +397,178 @@ class FlacrGUI(tk.Tk):
             self.process = None
 
     def _read_process_output(self):
-        """Read process output in a separate thread to prevent blocking"""
+        """Read process output in a separate thread to prevent blocking - using best practices"""
         try:
             if not self.process or not self.process.stdout:
                 return
             
+            # Use proper file handling with context management principles
+            stdout = self.process.stdout
+            
             while self.process_active and self.process.poll() is None:
                 try:
-                    line = self.process.stdout.readline()
+                    # Read line with proper error handling
+                    line = stdout.readline()
+                    
                     if line:
+                        # Ensure we have clean text
+                        line = line.rstrip('\r\n') + '\n'
                         self.output_queue.put(line)
                     else:
-                        # End of stream
-                        break
+                        # Check if process is still running
+                        if self.process.poll() is not None:
+                            break
+                        # Brief pause to prevent busy waiting
+                        time.sleep(0.01)
+                        
+                except (ValueError, OSError) as e:
+                    # Handle pipe closure or other I/O errors
+                    self.output_queue.put(f"Process communication error: {e}\n")
+                    break
                 except Exception as e:
-                    self.output_queue.put(f"Error reading output: {e}\n")
+                    self.output_queue.put(f"Unexpected output reading error: {e}\n")
                     break
             
-            # Read any remaining output
+            # Read any remaining output using best practices
             try:
-                remaining = self.process.stdout.read()
-                if remaining:
-                    for line in remaining.splitlines(keepends=True):
-                        self.output_queue.put(line)
-            except:
+                # Set stdout to non-blocking if possible (Unix only)
+                if HAS_FCNTL and hasattr(os, 'O_NONBLOCK') and hasattr(stdout, 'fileno'):
+                    try:
+                        fd = stdout.fileno()
+                        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+                        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+                    except (OSError, AttributeError):
+                        pass  # Not available or accessible
+                
+                # Read remaining output with timeout
+                remaining_lines = []
+                timeout_start = time.time()
+                
+                while time.time() - timeout_start < 2.0:  # 2 second timeout
+                    try:
+                        line = stdout.readline()
+                        if line:
+                            remaining_lines.append(line.rstrip('\r\n') + '\n')
+                        else:
+                            break
+                    except (ValueError, OSError):
+                        break
+                
+                # Add remaining lines to queue
+                for line in remaining_lines:
+                    self.output_queue.put(line)
+                    
+            except Exception as e:
+                # Don't add error for remaining output - it's expected during termination
                 pass
             
             # Signal end of output
             self.output_queue.put(None)
             
         except Exception as e:
-            self.output_queue.put(f"Output thread error: {e}\n")
+            self.output_queue.put(f"Critical output thread error: {e}\n")
             self.output_queue.put(None)
+        finally:
+            # Ensure stdout is properly handled
+            try:
+                if self.process and self.process.stdout and not self.process.stdout.closed:
+                    # Don't close stdout here - let subprocess handle it
+                    pass
+            except Exception:
+                pass
+
+    def _detect_current_operation(self, line):
+        """Detect what operation is currently being performed"""
+        line_lower = line.lower()
+        
+        if 'scanning' in line_lower or 'searching' in line_lower:
+            return 'scanning'
+        elif 'checking' in line_lower and ('files' in line_lower or 'metadata' in line_lower):
+            return 'checking'
+        elif 'encoding' in line_lower or 'recompress' in line_lower:
+            return 'encoding'
+        elif 'verifying' in line_lower or 'testing' in line_lower:
+            return 'verifying'
+        elif 'rsgain' in line_lower or 'replay gain' in line_lower:
+            return 'rsgain'
+        elif 'calculating' in line_lower:
+            return 'rsgain'
+        
+        return None
+
+    def _extract_file_info(self, line):
+        """Extract file information and operation type from output line"""
+        patterns = [
+            # Core processing patterns
+            (r'Processing:\s*(.+\.flac)', 'processing'),
+            (r'Verifying:\s*(.+\.flac)', 'verifying'),
+            (r'Encoding:\s*(.+\.flac)', 'encoding'),
+            (r'Checking:\s*(.+\.flac)', 'checking'),
+            (r'Successfully processed:\s*(.+\.flac)', 'completed'),
+            
+            # File status patterns
+            (r'Will re-encode:\s*(.+\.flac)', 'queued'),
+            (r'Skipping (.+\.flac):', 'skipped'),
+            (r'(.+\.flac): already encoded', 'skipped'),
+            
+            # Error patterns
+            (r'Error processing (.+\.flac):', 'error'),
+            (r'Verification error for (.+\.flac):', 'error'),
+            
+            # Generic file mention
+            (r'([^\\/:*?"<>|\s]+\.flac)', 'mentioned')
+        ]
+        
+        for pattern, operation_type in patterns:
+            match = re.search(pattern, line, re.IGNORECASE)
+            if match:
+                file_path = match.group(1).strip()
+                # Clean up path - remove quotes and extra spaces
+                file_path = file_path.strip('"\'')
+                return file_path, operation_type
+        
+        return None
+
+    def _is_rsgain_output(self, line):
+        """Check if line is rsgain output"""
+        rsgain_indicators = [
+            'rsgain', 'replay gain', 'loudness', 'lufs', 'peak',
+            'scanning', 'album gain', 'track gain'
+        ]
+        line_lower = line.lower()
+        return any(indicator in line_lower for indicator in rsgain_indicators)
+
+    def _parse_rsgain_output(self, line):
+        """Parse rsgain output for status information"""
+        line_lower = line.lower()
+        
+        # Look for progress indicators
+        if 'scanning' in line_lower:
+            # Extract file being scanned
+            file_match = re.search(r'([^\\/:*?"<>|\s]+\.flac)', line, re.IGNORECASE)
+            if file_match:
+                return f'Scanning {os.path.basename(file_match.group(1))}'
+            return 'Scanning files...'
+        
+        elif 'writing' in line_lower or 'updating' in line_lower:
+            return 'Writing replay gain tags...'
+        
+        elif 'album' in line_lower and 'gain' in line_lower:
+            return 'Calculating album gain...'
+        
+        elif 'track' in line_lower and 'gain' in line_lower:
+            return 'Calculating track gain...'
+        
+        elif 'complete' in line_lower or 'done' in line_lower:
+            return 'Replay gain calculation complete'
+        
+        # Look for progress numbers
+        progress_match = re.search(r'(\d+)/(\d+)', line)
+        if progress_match:
+            current, total = progress_match.groups()
+            return f'Progress: {current}/{total}'
+        
+        return None
 
     def _terminate_process_safely(self):
         """Safely terminate the process using Windows-appropriate methods"""
@@ -485,23 +668,33 @@ class FlacrGUI(tk.Tk):
             print(f"GUI update error: {e}")
             print(f"Text: {text}")
 
-    def update_progress(self, value, maximum, current_file=None):
+    def update_progress(self, value, maximum, current_file=None, status_text=None):
         # Schedule progress update in main thread
-        self.after_idle(self._update_progress_safe, value, maximum, current_file)
+        self.after_idle(self._update_progress_safe, value, maximum, current_file, status_text)
 
-    def _update_progress_safe(self, value, maximum, current_file=None):
+    def _update_progress_safe(self, value, maximum, current_file=None, status_text=None):
         try:
             self.progress['maximum'] = maximum
             self.progress['value'] = value
             
-            if current_file:
+            if status_text:
+                # Use provided status text
+                if maximum > 0:
+                    percentage = (value / maximum * 100)
+                    self.progress_label.config(text=f'{status_text} ({value}/{maximum} - {percentage:.1f}%)')
+                else:
+                    self.progress_label.config(text=f'{status_text} ({value} files)')
+            elif current_file:
+                # Fallback to file-based status
                 display_file = os.path.basename(current_file)
                 percentage = (value / maximum * 100) if maximum > 0 else 0
-                self.progress_label.config(text=f'Processing: {display_file}   ({value}/{maximum} - {percentage:.1f}%)')
+                self.progress_label.config(text=f'Processing: {display_file} ({value}/{maximum} - {percentage:.1f}%)')
             elif maximum > 0:
+                # Generic progress
                 percentage = (value / maximum * 100)
                 self.progress_label.config(text=f'Progress: {value}/{maximum} files ({percentage:.1f}%)')
             else:
+                # Unknown progress
                 self.progress_label.config(text=f'Processing... ({value} files)')
         except Exception as e:
             print(f"Progress update error: {e}")
