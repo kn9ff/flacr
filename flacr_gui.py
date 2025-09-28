@@ -1,356 +1,245 @@
-# --- Improved GUI for flacr.py ---
+import configparser
+import logging
+import os
+import platform
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Tuple
+
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-import threading
-import subprocess
-import signal
-import sys
-import os
-import shutil
-import configparser
-import re
-import time
-import queue
-import logging
-import traceback
-import platform
-from pathlib import Path
-from io import StringIO
-
-# Import fcntl for Unix systems only
-try:
-    import fcntl
-
-    HAS_FCNTL = True
-except ImportError:
-    HAS_FCNTL = False
 
 
-# Setup logging
-def setup_logging():
-    """Setup logging for the GUI application"""
-    log_dir = Path.home() / ".flacr_logs"
-    log_dir.mkdir(exist_ok=True)
+WINDOW_WIDTH = 900
+WINDOW_HEIGHT = 700
+MIN_WIDTH = 700
+MIN_HEIGHT = 600
+LOG_DIR = Path.home() / ".flacr_logs"
+LOG_FILE = LOG_DIR / "flacr_gui.log"
+CONFIG_PATH = Path.home() / ".flacr_gui.ini"
+ERROR_LOG_PATH = Path(__file__).parent / "flacr_error.log"
+SCRIPT_PATH = Path(__file__).parent / "flacr.py"
 
-    log_file = log_dir / "flacr_gui.log"
+
+def ensure_app_user_model_id() -> None:
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(  # type: ignore[attr-defined]
+            "kn9ff.flacr.gui"
+        )
+    except Exception:
+        logging.getLogger("flacr_gui").debug(
+            "Unable to set AppUserModelID", exc_info=True
+        )
+
+
+def setup_logging() -> logging.Logger:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    handlers = [logging.FileHandler(LOG_FILE, encoding="utf-8")]
+    if sys.stderr:
+        handlers.append(logging.StreamHandler(sys.stderr))
 
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        handlers=[
-            logging.FileHandler(log_file, encoding="utf-8"),
-            logging.StreamHandler(sys.stdout),
-        ],
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=handlers,
+        force=True,
     )
 
-    # Rotate log files if they get too large
-    if log_file.exists() and log_file.stat().st_size > 10 * 1024 * 1024:  # 10MB
-        backup_file = log_dir / "flacr_gui.log.old"
-        if backup_file.exists():
-            backup_file.unlink()
-        log_file.rename(backup_file)
+    if LOG_FILE.exists() and LOG_FILE.stat().st_size > 10 * 1024 * 1024:
+        backup = LOG_FILE.with_suffix(".log.old")
+        try:
+            if backup.exists():
+                backup.unlink()
+            LOG_FILE.replace(backup)
+        except OSError:
+            logging.getLogger("flacr_gui").warning("Unable to rotate log file")
 
     return logging.getLogger("flacr_gui")
 
 
 logger = setup_logging()
+ensure_app_user_model_id()
 
-# Use pathlib for better file handling
-SCRIPT_PATH = Path(__file__).parent / "flacr.py"
-CONFIG_PATH = Path.home() / ".flacr_gui.ini"
-ERROR_LOG_PATH = Path(__file__).parent / "flacr_error.log"
+
+def format_duration(seconds: int) -> str:
+    seconds = max(0, seconds)
+    minutes, secs = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}h {minutes:02d}m {secs:02d}s"
+    return f"{minutes:d}m {secs:02d}s"
+
+
+@dataclass(slots=True)
+class ProcessingOptions:
+    directory: Optional[Path]
+    encode_single: bool
+    log_errors: bool
+    thread_count: int
+    show_progress: bool
+    replay_gain: bool
+    scan_only: bool
+    test_only: bool
+    quick_mode: bool
+    sequential_mode: bool
+    check_encoder: bool
+
+    @classmethod
+    def from_gui(cls, gui: "FlacrGUI") -> "ProcessingOptions":
+        raw_dir = gui.dir_var.get().strip()
+        directory = Path(raw_dir) if raw_dir else None
+        return cls(
+            directory=directory,
+            encode_single=bool(gui.j_var.get()),
+            log_errors=bool(gui.l_var.get()),
+            thread_count=max(1, int(gui.m_var.get() or 1)),
+            show_progress=bool(gui.p_var.get()),
+            replay_gain=bool(gui.r_var.get()),
+            scan_only=bool(gui.s_var.get()),
+            test_only=bool(gui.t_var.get()),
+            quick_mode=bool(gui.Q_var.get()),
+            sequential_mode=bool(gui.S_var.get()),
+            check_encoder=bool(gui.E_var.get()),
+        )
+
+    def validate(self) -> Tuple[bool, Optional[str]]:
+        if self.directory is None:
+            return False, "Please select a directory containing FLAC files."
+        if not self.directory.exists():
+            return False, f"Selected directory does not exist: {self.directory}"
+        if not self.directory.is_dir():
+            return False, "Selected path is not a directory."
+        if self.thread_count < 1:
+            return False, "Thread count must be at least 1."
+        if platform.system() == "Windows":
+            try:
+                self.directory.resolve(strict=False)
+            except OSError as exc:
+                return False, f"Unable to access directory: {exc}"
+        return True, None
+
+    @property
+    def requires_tqdm(self) -> bool:
+        return self.show_progress or self.quick_mode or self.sequential_mode
+
+    @property
+    def requires_rsgain(self) -> bool:
+        return self.replay_gain or self.quick_mode or self.sequential_mode
+
+    def to_command(self) -> list[str]:
+        command = [sys.executable, str(SCRIPT_PATH)]
+        if self.directory:
+            command += ["-d", str(self.directory)]
+        if self.encode_single:
+            command.append("-j")
+        if self.log_errors:
+            command.append("-l")
+        if self.thread_count:
+            command += ["-m", str(self.thread_count)]
+        if self.show_progress:
+            command.append("-p")
+        if self.replay_gain:
+            command.append("-r")
+        if self.scan_only:
+            command.append("-s")
+        if self.test_only:
+            command.append("-t")
+        if self.quick_mode:
+            command.append("-Q")
+        if self.sequential_mode:
+            command.append("-S")
+        if self.check_encoder:
+            command.append("-E")
+        return command
 
 
 class FlacrGUI(tk.Tk):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.title("FLACR - FLAC Recompressor GUI")
 
-        # Initialize state variables with comprehensive tracking
-        self.process = None
+        self.process: Optional[subprocess.Popen[str]] = None
+        self.process_thread: Optional[threading.Thread] = None
         self.process_active = False
-        self.max_log_lines = 2000  # Increased for better logging
-        self.output_queue = None
-        self.start_time = None
+        self.output_queue: Optional[queue.Queue[tuple[str, object]]] = None
+        self.max_log_lines = 2000
+        self.start_time: Optional[float] = None
         self.files_processed = 0
-        self.total_files = None
-        self._last_display_update = time.time()
-        self._completion_handled = False
+        self.total_files = 0
+        self._seen_files: set[str] = set()
+        self._last_output_time: Optional[float] = None
+        self._exit_code: Optional[int] = None
+        self._queue_poll_job: Optional[str] = None
+        self._runtime_job: Optional[str] = None
+        self._cancel_requested = False
+        self._pending_close = False
+        self._tqdm_available: Optional[bool] = None
 
-        logger.info("Initializing FLAC GUI")
+        self._setup_window()
+        self._create_widgets()
+        self._load_settings()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.after(200, self._validate_environment)
 
-        # Setup GUI with error handling
-        try:
-            self._setup_window()
-            self.create_widgets()
-            self.load_settings()
-            self.protocol("WM_DELETE_WINDOW", self.on_close)
-
-            # Validate environment after GUI setup
-            self.after(100, self._validate_environment)
-
-        except Exception as e:
-            logger.error(f"Error during GUI initialization: {e}")
-            logger.error(traceback.format_exc())
-            messagebox.showerror(
-                "Initialization Error", f"Failed to initialize GUI: {e}"
-            )
-
-        logger.info("FLAC GUI initialized successfully")
-
-    def _setup_window(self):
-        """Setup window properties with comprehensive configuration"""
-        try:
-            # Set application icon if available
-            icon_paths = [
-                Path(__file__).parent / "flaccheck.ico",
-                Path(__file__).parent / "icon.ico",
-                Path.cwd() / "flaccheck.ico",
-                Path.cwd() / "icon.ico",
-            ]
-
-            for icon_path in icon_paths:
-                if icon_path.exists():
-                    try:
-                        self.iconbitmap(str(icon_path))
-                        logger.info(f"Set application icon: {icon_path}")
-                        break
-                    except Exception as e:
-                        logger.warning(f"Could not set icon {icon_path}: {e}")
-            else:
-                logger.info("No application icon found, using default")
-
-        except Exception as e:
-            logger.warning(f"Error setting up application icon: {e}")
-
-        # Window size and position
-        try:
-            self.geometry("900x700")  # Larger window for better usability
-            self.minsize(700, 600)  # Minimum usable size
-
-            # Center window on screen with error handling
-            try:
-                self.update_idletasks()
-                screen_width = self.winfo_screenwidth()
-                screen_height = self.winfo_screenheight()
-                window_width = 900
-                window_height = 700
-
-                x = max(0, (screen_width - window_width) // 2)
-                y = max(0, (screen_height - window_height) // 2)
-
-                self.geometry(f"{window_width}x{window_height}+{x}+{y}")
-                logger.info(f"Window positioned at {x}x{y}")
-
-            except Exception as e:
-                logger.warning(f"Could not center window: {e}")
-                # Fallback to default positioning
-                self.geometry("900x700+100+100")
-
-        except Exception as e:
-            logger.error(f"Error setting up window geometry: {e}")
-            # Minimal fallback
-            try:
-                self.geometry("800x600")
-            except:
-                pass  # Use whatever default tkinter provides
-
-    def _validate_environment(self):
-        """Comprehensive environment validation with user feedback"""
-        try:
-            logger.info("Starting environment validation")
-
-            # Clear any existing output and show validation status
-            if hasattr(self, "output_text"):
-                self.output_text.config(state="normal")
-                self.output_text.delete("1.0", tk.END)
-                self.output_text.config(state="disabled")
-
-            self.append_output("🔧 FLACR GUI - Environment Validation\n", tag="info")
-            self.append_output("=" * 60 + "\n", tag="info")
-
-            # System information
-            self.append_output(
-                f"📋 System: {platform.system()} {platform.release()}\n", tag="info"
-            )
-            self.append_output(
-                f"🐍 Python: {sys.version.split()[0]} ({sys.executable})\n", tag="info"
-            )
-            self.append_output(f"📁 Working Directory: {Path.cwd()}\n", tag="info")
-            self.append_output("\n", tag="info")
-
-            # Check flacr.py script
-            flacr_script = Path.cwd() / "flacr.py"
-            if flacr_script.exists():
-                self.append_output("✅ flacr.py found\n", tag="success")
-
-                # Validate script syntax
+    def _setup_window(self) -> None:
+        icon_candidates = [
+            Path(__file__).parent / "flaccheck.ico",
+            Path(__file__).parent / "icon.ico",
+            Path.cwd() / "flaccheck.ico",
+            Path.cwd() / "icon.ico",
+        ]
+        for icon in icon_candidates:
+            if icon.exists():
                 try:
-                    result = subprocess.run(
-                        [sys.executable, "-m", "py_compile", str(flacr_script)],
-                        capture_output=True,
-                        text=True,
-                        timeout=10,
-                    )
-                    if result.returncode == 0:
-                        self.append_output(
-                            "✅ flacr.py syntax validated\n", tag="success"
-                        )
-                    else:
-                        self.append_output(
-                            f"❌ flacr.py syntax error: {result.stderr}\n", tag="error"
-                        )
+                    self.iconbitmap(str(icon))
+                    break
+                except Exception:
+                    logger.debug("Unable to apply icon %s", icon, exc_info=True)
 
-                except Exception as e:
-                    self.append_output(
-                        f"⚠️  Could not validate flacr.py syntax: {e}\n", tag="warn"
-                    )
-            else:
-                self.append_output(
-                    f"❌ flacr.py not found in {Path.cwd()}\n", tag="error"
-                )
-                self.append_output(
-                    "   Please ensure flacr.py is in the same directory as this GUI.\n",
-                    tag="error",
-                )
-
-            # Check for required tools (optional, as flacr.py will check these)
-            tools_to_check = ["flac", "metaflac"]
-            for tool in tools_to_check:
-                try:
-                    result = subprocess.run(
-                        [tool, "--version"], capture_output=True, text=True, timeout=5
-                    )
-                    if result.returncode == 0:
-                        version_line = (
-                            result.stderr.split("\n")[0]
-                            if result.stderr
-                            else result.stdout.split("\n")[0]
-                        )
-                        self.append_output(
-                            f"✅ {tool}: {version_line}\n", tag="success"
-                        )
-                    else:
-                        self.append_output(f"⚠️  {tool}: Check failed\n", tag="warn")
-                except FileNotFoundError:
-                    self.append_output(f"⚠️  {tool}: Not found in PATH\n", tag="warn")
-                except Exception as e:
-                    self.append_output(f"⚠️  {tool}: Check error: {e}\n", tag="warn")
-
-            # Usage instructions
-            self.append_output("\n" + "=" * 60 + "\n", tag="info")
-            self.append_output("📖 USAGE INSTRUCTIONS\n", tag="info")
-            self.append_output("=" * 60 + "\n", tag="info")
-            self.append_output(
-                "1. 📁 Click 'Browse Directory' to select a folder with FLAC files\n",
-                tag="info",
-            )
-            self.append_output(
-                "2. ⚙️  Configure processing options as needed\n", tag="info"
-            )
-            self.append_output("3. ▶️  Click 'Run' to start processing\n", tag="info")
-            self.append_output(
-                "4. 🛑 Use 'Cancel' to stop processing if needed\n", tag="info"
-            )
-            self.append_output(
-                "\n💡 Tip: The log will show detailed progress and any issues encountered.\n",
-                tag="info",
-            )
-            self.append_output("=" * 60 + "\n\n", tag="info")
-
-            # Set ready status
-            if hasattr(self, "progress_label"):
-                self.progress_label.config(text="Ready - Select directory to begin")
-
-            logger.info("Environment validation completed")
-
-        except Exception as e:
-            logger.error(f"Environment validation failed: {e}")
-            logger.error(traceback.format_exc())
-            if hasattr(self, "append_output"):
-                self.append_output(
-                    f"❌ Environment validation error: {e}\n", tag="error"
-                )
-
-    def on_close(self):
-        """Handle application closing with proper cleanup"""
+        self.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}")
+        self.minsize(MIN_WIDTH, MIN_HEIGHT)
         try:
-            logger.info("Application close requested")
+            self.update_idletasks()
+            screen_w = self.winfo_screenwidth()
+            screen_h = self.winfo_screenheight()
+            x_pos = max(0, (screen_w - WINDOW_WIDTH) // 2)
+            y_pos = max(0, (screen_h - WINDOW_HEIGHT) // 2)
+            self.geometry(f"{WINDOW_WIDTH}x{WINDOW_HEIGHT}+{x_pos}+{y_pos}")
+        except Exception:
+            logger.debug("Unable to centre window", exc_info=True)
 
-            # Check if process is running
-            if self.process_active and hasattr(self, "process") and self.process:
-                response = messagebox.askyesno(
-                    "Process Running",
-                    "A FLAC processing operation is currently running.\n\n"
-                    "Do you want to cancel it and exit?",
-                    icon="warning",
-                )
-
-                if response:
-                    logger.info("User chose to cancel process and exit")
-                    try:
-                        self.cancel_process()
-                        # Give some time for cleanup
-                        self.after(1000, self._force_close)
-                    except Exception as e:
-                        logger.error(f"Error cancelling process: {e}")
-                        self._force_close()
-                else:
-                    logger.info("User chose to keep process running")
-                    return
-            else:
-                self._force_close()
-
-        except Exception as e:
-            logger.error(f"Error during application close: {e}")
-            self._force_close()
-
-    def _force_close(self):
-        """Force application close with cleanup"""
-        try:
-            logger.info("Forcing application close")
-
-            # Save settings
-            try:
-                self.save_settings()
-            except Exception as e:
-                logger.error(f"Error saving settings: {e}")
-
-            # Final cleanup
-            self._cleanup_process()
-
-            # Close window
-            self.quit()
-            self.destroy()
-
-        except Exception as e:
-            logger.error(f"Error during force close: {e}")
-            try:
-                self.destroy()
-            except:
-                pass
-
-    def create_widgets(self):
-        self.grid_rowconfigure(6, weight=1)
         self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(4, weight=1)
 
-        # Directory selection
+    def _create_widgets(self) -> None:
         dir_frame = tk.Frame(self)
         dir_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 0))
         dir_frame.grid_columnconfigure(1, weight=1)
+
         tk.Label(dir_frame, text="Directory:").grid(row=0, column=0, sticky="w")
-        self.dir_var = tk.StringVar(value=os.getcwd())
+        self.dir_var = tk.StringVar(value=str(Path.cwd()))
         self.dir_entry = tk.Entry(dir_frame, textvariable=self.dir_var, width=50)
-        self.dir_entry.grid(row=0, column=1, sticky="ew")
+        self.dir_entry.grid(row=0, column=1, sticky="ew", padx=(5, 5))
         tk.Button(dir_frame, text="Browse...", command=self.browse_dir).grid(
-            row=0, column=2, padx=(5, 0)
+            row=0, column=2, sticky="e"
         )
 
-        # Options
         self.options_frame = tk.LabelFrame(self, text="Options")
-        self.options_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=5)
-        for i in range(0, 4):
-            self.options_frame.grid_columnconfigure(i, weight=1)
+        self.options_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=10)
+        for col in range(4):
+            self.options_frame.grid_columnconfigure(col, weight=1)
 
         self.j_var = tk.BooleanVar()
         self.j_check = tk.Checkbutton(
@@ -359,53 +248,50 @@ class FlacrGUI(tk.Tk):
             variable=self.j_var,
             command=self.update_option_states,
         )
-        self.j_check.grid(row=0, column=0, sticky="w")
+        self.j_check.grid(row=0, column=0, sticky="w", padx=(5, 0), pady=2)
 
         self.l_var = tk.BooleanVar()
         self.l_check = tk.Checkbutton(
             self.options_frame, text="Log errors to flacr.log (-l)", variable=self.l_var
         )
-        self.l_check.grid(row=0, column=1, sticky="w")
+        self.l_check.grid(row=0, column=1, sticky="w", padx=(5, 0), pady=2)
 
-        self.m_label = tk.Label(self.options_frame, text="Thread count (-m):")
-        self.m_label.grid(row=1, column=0, sticky="w")
-        self.m_var = tk.IntVar(value=1)
+        self.m_var = tk.IntVar(value=max(1, os.cpu_count() or 1))
+        tk.Label(self.options_frame, text="Thread count (-m):").grid(
+            row=1, column=0, sticky="w", padx=(5, 0)
+        )
         self.m_spin = tk.Spinbox(
             self.options_frame,
             from_=1,
-            to=os.cpu_count(),
+            to=max(1, os.cpu_count() or 1),
             textvariable=self.m_var,
-            width=5,
+            width=6,
         )
-        self.m_spin.grid(row=1, column=1, sticky="w")
+        self.m_spin.grid(row=1, column=1, sticky="w", padx=(5, 0), pady=2)
 
         self.p_var = tk.BooleanVar()
         self.p_check = tk.Checkbutton(
             self.options_frame, text="Show progress bars (-p)", variable=self.p_var
         )
-        self.p_check.grid(row=1, column=2, sticky="w")
+        self.p_check.grid(row=1, column=2, sticky="w", padx=(5, 0), pady=2)
 
         self.r_var = tk.BooleanVar()
         self.r_check = tk.Checkbutton(
             self.options_frame, text="Calculate replay gain (-r)", variable=self.r_var
         )
-        self.r_check.grid(row=2, column=0, sticky="w")
+        self.r_check.grid(row=2, column=0, sticky="w", padx=(5, 0), pady=2)
 
         self.s_var = tk.BooleanVar()
         self.s_check = tk.Checkbutton(
-            self.options_frame,
-            text="Only scan current folder (-s)",
-            variable=self.s_var,
+            self.options_frame, text="Only scan current folder (-s)", variable=self.s_var
         )
-        self.s_check.grid(row=2, column=1, sticky="w")
+        self.s_check.grid(row=2, column=1, sticky="w", padx=(5, 0), pady=2)
 
         self.t_var = tk.BooleanVar()
         self.t_check = tk.Checkbutton(
-            self.options_frame,
-            text="Test only, skip recompression (-t)",
-            variable=self.t_var,
+            self.options_frame, text="Test only, skip recompression (-t)", variable=self.t_var
         )
-        self.t_check.grid(row=2, column=2, sticky="w")
+        self.t_check.grid(row=2, column=2, sticky="w", padx=(5, 0), pady=2)
 
         self.Q_var = tk.BooleanVar()
         self.Q_check = tk.Checkbutton(
@@ -414,7 +300,7 @@ class FlacrGUI(tk.Tk):
             variable=self.Q_var,
             command=self.update_option_states,
         )
-        self.Q_check.grid(row=3, column=0, sticky="w")
+        self.Q_check.grid(row=3, column=0, sticky="w", padx=(5, 0), pady=2)
 
         self.S_var = tk.BooleanVar()
         self.S_check = tk.Checkbutton(
@@ -423,1373 +309,614 @@ class FlacrGUI(tk.Tk):
             variable=self.S_var,
             command=self.update_option_states,
         )
-        self.S_check.grid(row=3, column=1, sticky="w")
+        self.S_check.grid(row=3, column=1, sticky="w", padx=(5, 0), pady=2)
 
         self.E_var = tk.BooleanVar()
         self.E_check = tk.Checkbutton(
             self.options_frame, text="Check ENCODER metadata (-E)", variable=self.E_var
         )
-        self.E_check.grid(row=3, column=2, sticky="w")
+        self.E_check.grid(row=3, column=2, sticky="w", padx=(5, 0), pady=2)
 
-        # Progress bar and label
         self.progress_frame = tk.Frame(self)
-        self.progress_frame.grid(row=2, column=0, pady=10, padx=10, sticky="ew")
+        self.progress_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=5)
+
         self.progress_label = tk.Label(
             self.progress_frame,
             text="Ready",
             anchor="w",
-            bg="#f0f0f0",
             relief="sunken",
-            padx=5,
+            padx=6,
         )
         self.progress_label.pack(fill="x", side="top")
+
         self.progress = ttk.Progressbar(
-            self.progress_frame, orient="horizontal", mode="determinate", length=400
+            self.progress_frame, orient="horizontal", mode="determinate"
         )
-        self.progress.pack(fill="x", side="top", pady=(2, 0))
+        self.progress.pack(fill="x", side="top", pady=(4, 0))
 
-        # Run and log buttons
+        self.runtime_var = tk.StringVar(value="Idle")
+        self.runtime_label = tk.Label(
+            self.progress_frame,
+            textvariable=self.runtime_var,
+            anchor="w",
+            padx=6,
+        )
+        self.runtime_label.pack(fill="x", side="top", pady=(4, 0))
+
         btn_frame = tk.Frame(self)
-        btn_frame.grid(row=3, column=0, pady=5, sticky="ew")
-        btn_frame.grid_columnconfigure(0, weight=1)
+        btn_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=5)
+        btn_frame.grid_columnconfigure(4, weight=1)
+
         self.run_button = tk.Button(btn_frame, text="Run", command=self.run_flacr)
-        self.run_button.grid(row=0, column=0, padx=5, sticky="w")
+        self.run_button.grid(row=0, column=0, padx=(0, 5), sticky="w")
+
         self.cancel_button = tk.Button(
-            btn_frame, text="Cancel", command=self.cancel_flacr, state="disabled"
+            btn_frame, text="Cancel", state="disabled", command=self.cancel_flacr
         )
-        self.cancel_button.grid(row=0, column=1, padx=5, sticky="w")
-        self.log_button = tk.Button(
-            btn_frame, text="View Error Log", command=self.open_error_log
-        )
-        self.log_button.grid(row=0, column=2, padx=5, sticky="w")
-        self.help_button = tk.Button(btn_frame, text="Help", command=self.show_help)
-        self.help_button.grid(row=0, column=3, padx=5, sticky="w")
-        self.copy_cmd_button = tk.Button(
-            btn_frame, text="Copy CLI Command", command=self.copy_cli_command
-        )
-        self.copy_cmd_button.grid(row=0, column=4, padx=5, sticky="w")
+        self.cancel_button.grid(row=0, column=1, padx=(0, 5), sticky="w")
 
-        # Output box with tag for error highlighting
+        tk.Button(btn_frame, text="View Error Log", command=self.open_error_log).grid(
+            row=0, column=2, padx=(0, 5), sticky="w"
+        )
+        tk.Button(btn_frame, text="Help", command=self.show_help).grid(
+            row=0, column=3, padx=(0, 5), sticky="w"
+        )
+        tk.Button(btn_frame, text="Copy CLI Command", command=self.copy_cli_command).grid(
+            row=0, column=4, sticky="e"
+        )
+
         self.output_text = tk.Text(
-            self, height=15, width=80, state="normal", wrap="word"
+            self, height=18, wrap="word", state="disabled", bg="#1e1e1e", fg="#dcdcdc"
         )
-        self.output_text.grid(row=4, column=0, padx=10, pady=5, sticky="nsew")
-        self.output_text.tag_configure("error", foreground="red")
-        self.output_text.tag_configure("warn", foreground="orange")
-        self.output_text.tag_configure("bold", font=("TkDefaultFont", 10, "bold"))
-        self.output_text.tag_configure("skipped", foreground="blue")
+        self.output_text.grid(row=4, column=0, padx=10, pady=(0, 10), sticky="nsew")
+        self.output_text.tag_configure("error", foreground="#ff6666")
+        self.output_text.tag_configure("warn", foreground="#ffcc66")
+        self.output_text.tag_configure("success", foreground="#90ee90")
+        self.output_text.tag_configure("info", foreground="#add8e6")
 
-        # Make output box expandable
-        self.grid_rowconfigure(4, weight=1)
-        self.grid_columnconfigure(0, weight=1)
+    def _validate_environment(self) -> None:
+        logger.info("Validating environment")
+        self.output_text.config(state="normal")
+        self.output_text.delete("1.0", tk.END)
+        self.output_text.config(state="disabled")
 
-    def browse_dir(self):
-        """Browse for directory with better error handling"""
-        try:
-            current_dir = self.dir_var.get()
+        details = [
+            "FLACR GUI - Environment validation",
+            "=" * 60,
+            f"System: {platform.system()} {platform.release()}",
+            f"Python: {sys.version.split()[0]} ({sys.executable})",
+            f"Working directory: {Path.cwd()}",
+            "",
+        ]
 
-            # Validate current directory
-            if not current_dir or not Path(current_dir).exists():
-                current_dir = str(Path.home())
+        if SCRIPT_PATH.exists():
+            details.append(f"flacr.py located at {SCRIPT_PATH}")
+        else:
+            details.append(f"flacr.py missing (expected at {SCRIPT_PATH})")
 
-            directory = filedialog.askdirectory(
-                initialdir=current_dir, title="Select directory containing FLAC files"
-            )
+        for line in details:
+            self.append_output(line + "\n", tag="info")
 
-            if directory:
-                dir_path = Path(directory)
-
-                # Validate directory permissions
-                if not dir_path.is_dir():
-                    messagebox.showerror(
-                        "Invalid Directory", "Selected path is not a directory."
-                    )
-                    return
-
-                if not os.access(str(dir_path), os.R_OK):
-                    messagebox.showerror(
-                        "Permission Error", "Cannot read from selected directory."
-                    )
-                    return
-
-                self.dir_var.set(str(dir_path))
-                logger.info(f"Directory selected: {directory}")
-
-                # Give user feedback about the selection
-                try:
-                    flac_count = len(list(dir_path.rglob("*.flac")))
-                    if flac_count > 0:
-                        self.progress_label.config(
-                            text=f"Directory selected - Found {flac_count} FLAC files"
-                        )
-                    else:
-                        self.progress_label.config(
-                            text="Directory selected - No FLAC files found"
-                        )
-                except Exception as e:
-                    logger.warning(f"Could not count FLAC files: {e}")
-                    self.progress_label.config(text="Directory selected")
-
-        except Exception as e:
-            logger.error(f"Error in browse_dir: {e}")
-            messagebox.showerror("Error", f"Failed to select directory: {e}")
-
-    def run_flacr(self):
-        """Run flacr with comprehensive validation and error handling"""
-        try:
-            logger.info("Run button clicked - starting validation")
-            print("DEBUG: Run button clicked!")
-            
-            # Validate dependencies first
-            if not self.check_dependencies():
-                logger.warning("Dependencies check failed")
-                return
-
-            # Validate directory
-            directory = Path(self.dir_var.get())
-            logger.info(f"Validating directory: {directory}")
-            
-            if not directory.exists():
-                messagebox.showerror(
-                    "Invalid Directory", "Selected directory does not exist."
-                )
-                return
-
-            if not directory.is_dir():
-                messagebox.showerror(
-                    "Invalid Directory", "Selected path is not a directory."
-                )
-                return
-
-            if not os.access(str(directory), os.R_OK):
-                messagebox.showerror(
-                    "Permission Error", "Cannot read from selected directory."
-                )
-                return
-
-            logger.info("Directory validation passed")
-
-            # Check for tqdm if progress is enabled
-            if self.p_var.get() and not self.tqdm_installed():
-                response = messagebox.askyesno(
-                    "tqdm not installed",
-                    "tqdm is required for progress bars. Continue anyway?\n\n"
-                    "Install with: pip install tqdm",
-                )
-                if not response:
-                    return
-
-            # Check FLAC version for threading options
-            if self.j_var.get() or self.S_var.get():
-                if not self.flac_supports_threads():
-                    messagebox.showwarning(
-                        "FLAC Version",
-                        "FLAC >=1.5.0 is required for multi-threaded encoding (-j/-S).\n"
-                        "Please upgrade FLAC or disable threading options.",
-                    )
-                    return
-
-            # Save settings before starting
-            self.save_settings()
-
-            # Initialize process state
-            self.start_time = time.time()
-            self.files_processed = 0
-            self.total_files = None
-            self._completion_handled = False
-
-            logger.info("Updating UI state")
-            # Update UI state
-            self.run_button.config(state="disabled")
-            self.cancel_button.config(state="normal")
-            self.progress_label.config(text="Initializing...")
-
-            # Clear and prepare output
-            self._prepare_output()
-
-            # Build command arguments
-            args = self.build_args()
-            logger.info(f"Starting flacr with args: {args}")
-            print(f"DEBUG: Command args: {args}")
-
-            # Start processing in background thread
-            logger.info(f"Starting thread with args: {args}")
-            threading.Thread(
-                target=self._run_flacr_thread,
-                args=(args,),
-                daemon=True,
-                name="FlacProcessorThread",
-            ).start()
-            logger.info("Background thread started successfully")
-
-        except Exception as e:
-            logger.error(f"Error starting flacr: {e}")
-            logger.error(traceback.format_exc())
-            messagebox.showerror("Error", f"Failed to start processing: {e}")
-            self.run_button.config(state="normal")
-            self.cancel_button.config(state="disabled")
-
-    def _prepare_output(self):
-        """Prepare output text widget for new run"""
-        try:
-            self.output_text.config(state="normal")
-            self.output_text.delete(1.0, tk.END)
-
-            # Add startup information
-            self.output_text.insert(tk.END, "FLAC Recompressor Starting...\n", "bold")
-            self.output_text.insert(tk.END, f"Directory: {self.dir_var.get()}\n")
-            self.output_text.insert(
-                tk.END, f'Started at: {time.strftime("%Y-%m-%d %H:%M:%S")}\n'
-            )
-            self.output_text.insert(
-                tk.END,
-                "Note: Timeouts are dynamic based on operation (5min-2hrs).\n",
-                "warn",
-            )
-            self.output_text.insert(tk.END, "-" * 50 + "\n")
-
-            self.output_text.config(state="disabled")
-            self.progress["value"] = 0
-            self.progress_label.config(text="Initializing...")
-
-        except Exception as e:
-            logger.error(f"Error preparing output: {e}")
-
-    def cancel_flacr(self):
-        """Cancel the running flacr process"""
-        if self.process and self.process.poll() is None:
+        if SCRIPT_PATH.exists():
             try:
-                self.append_output("\n[CANCELLED BY USER]\n", tag="error")
-                self.process_active = False  # Signal threads to stop
-                self._terminate_process_safely()
-            except Exception as e:
-                self.append_output(f"Error during cancellation: {e}\n", tag="error")
-            finally:
-                self.run_button.config(state="normal")
-                self.cancel_button.config(state="disabled")
+                result = subprocess.run(
+                    [sys.executable, "-m", "py_compile", str(SCRIPT_PATH)],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if result.returncode == 0:
+                    self.append_output("Syntax check: OK\n", tag="success")
+                else:
+                    self.append_output(
+                        f"Syntax check failed: {result.stderr.strip()}\n", tag="error"
+                    )
+            except subprocess.SubprocessError as exc:
+                self.append_output(f"Syntax check failed: {exc}\n", tag="warn")
+        else:
+            self.progress_label.config(text="flacr.py missing - update directory")
 
-    def tqdm_installed(self):
+        self.progress_label.config(text="Ready - Select directory to begin")
+
+    def browse_dir(self) -> None:
+        initial_dir = self.dir_var.get()
+        if not initial_dir or not Path(initial_dir).exists():
+            initial_dir = str(Path.home())
+
+        directory = filedialog.askdirectory(
+            initialdir=initial_dir, title="Select directory containing FLAC files"
+        )
+        if not directory:
+            return
+
+        dir_path = Path(directory)
+        if not dir_path.is_dir():
+            messagebox.showerror("Invalid Directory", "Selected path is not a directory.")
+            return
+
+        self.dir_var.set(str(dir_path))
+        logger.info("Directory set to %s", dir_path)
+
         try:
-            import tqdm
+            flac_count = sum(1 for _ in dir_path.rglob("*.flac"))
+        except OSError as exc:
+            logger.warning("Unable to inspect directory %s", dir_path, exc_info=True)
+            self.progress_label.config(text=f"Directory selected: {dir_path}")
+            return
 
-            return True
-        except ImportError:
-            return False
-
-    def flac_supports_threads(self):
-        flac_path = shutil.which("flac")
-        if not flac_path:
-            return False
-        try:
-            out = subprocess.check_output(
-                [flac_path, "--version"], encoding="utf-8", stderr=subprocess.STDOUT
+        if flac_count:
+            self.progress_label.config(
+                text=f"Directory selected - Found {flac_count} FLAC file(s)"
             )
-            m = re.search(r"flac (\d+)\.(\d+)\.(\d+)", out)
-            if m:
-                major, minor, patch = map(int, m.groups())
-                return (major > 1) or (major == 1 and minor >= 5)
-        except Exception:
-            return False
-        return False
+        else:
+            self.progress_label.config(text="Directory selected - No FLAC files found")
 
-    def build_args(self):
-        """Build command line arguments for flacr.py"""
-        args = [sys.executable, str(SCRIPT_PATH)]  # Convert Path to string
-        if self.dir_var.get():
-            args += ["-d", self.dir_var.get()]
-        if self.j_var.get():
-            args.append("-j")
-        if self.l_var.get():
-            args.append("-l")
-        if self.m_var.get():
-            args += ["-m", str(self.m_var.get())]
-        if self.p_var.get():
-            args.append("-p")
-        if self.r_var.get():
-            args.append("-r")
-        if self.s_var.get():
-            args.append("-s")
-        if self.t_var.get():
-            args.append("-t")
-        if self.Q_var.get():
-            args.append("-Q")
-        if self.S_var.get():
-            args.append("-S")
-        if self.E_var.get():
-            args.append("-E")
-        return args
+    def run_flacr(self) -> None:
+        options = ProcessingOptions.from_gui(self)
+        valid, message = options.validate()
+        if not valid:
+            messagebox.showerror("Invalid Configuration", message)
+            return
 
-    def _run_flacr_thread(self, args):
-        """Main processing thread with comprehensive error handling"""
-        try:
-            logger.info("Starting FLAC processing thread")
-            logger.info(f"Thread args: {args}")
+        if not SCRIPT_PATH.exists():
+            messagebox.showerror(
+                "Script Missing",
+                f"Cannot locate flacr.py at {SCRIPT_PATH}. Update the installation and retry.",
+            )
+            return
 
-            # Initialize queue and process state
-            self.output_queue = queue.Queue(maxsize=5000)  # Increase queue size for better handling
-            self.process_active = True
+        if not self.check_dependencies(options):
+            return
 
-            # Configure subprocess creation
-            creation_flags = 0
-            if sys.platform == "win32":
-                creation_flags = subprocess.CREATE_NO_WINDOW
+        if (options.encode_single or options.sequential_mode) and not self.flac_supports_threads():
+            messagebox.showwarning(
+                "FLAC Upgrade Recommended",
+                "FLAC 1.5.0 or newer is required for -j / -S. Disable the option or upgrade FLAC.",
+            )
+            return
 
-            # Start subprocess with proper error handling
+        if options.requires_tqdm and not self.tqdm_installed():
+            if not messagebox.askyesno(
+                "tqdm Not Installed",
+                "Progress bars require the tqdm package. Continue without it?",
+            ):
+                return
+
+        self.save_settings()
+        self._prepare_for_run(options)
+        command = options.to_command()
+        self._start_process(command)
+
+    def _prepare_for_run(self, options: ProcessingOptions) -> None:
+        self.process_active = True
+        self._cancel_requested = False
+        self.files_processed = 0
+        self.total_files = 0
+        self._seen_files.clear()
+        self._exit_code = None
+        self.start_time = time.time()
+        self._last_output_time = self.start_time
+
+        self.output_queue = queue.Queue()
+        self.progress_label.config(text="Initialising...")
+        self.progress.configure(value=0, maximum=1)
+        self.runtime_var.set("Elapsed: 0s")
+        self._start_runtime_timer()
+        self._set_buttons_running()
+
+        self.output_text.config(state="normal")
+        self.output_text.delete("1.0", tk.END)
+        self.output_text.config(state="disabled")
+        start_stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        self.append_output(f"Starting flacr.py at {start_stamp}\n", tag="info")
+        self.append_output(
+            "Command: " + " ".join(options.to_command()) + "\n", tag="info"
+        )
+
+    def _start_process(self, command: list[str]) -> None:
+        working_dir = str(SCRIPT_PATH.parent)
+        env = os.environ.copy()
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        env["PYTHONUNBUFFERED"] = "1"
+
+        creationflags = 0
+        startupinfo = None
+        if os.name == "nt":
+            creationflags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+        def worker() -> None:
             try:
-                logger.info(f"Starting subprocess with args: {args}")
+                logger.info("Launching flacr.py with args: %s", command)
                 self.process = subprocess.Popen(
-                    args,
+                    command,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
-                    bufsize=1,  # Line buffering
-                    creationflags=creation_flags,
-                    universal_newlines=True,
-                    env=dict(os.environ, PYTHONUNBUFFERED="1"),  # Force unbuffered output
-                    cwd=str(Path(self.dir_var.get()).parent),  # Set working directory
+                    encoding="utf-8",
+                    errors="replace",
+                    cwd=working_dir,
+                    env=env,
+                    creationflags=creationflags,
+                    startupinfo=startupinfo,
                 )
-                logger.info(f"Process started with PID: {self.process.pid}")
+                assert self.process.stdout is not None
+                for raw_line in self.process.stdout:
+                    line = raw_line.rstrip("\r\n")
+                    if self.output_queue:
+                        self.output_queue.put(("line", line))
+                exit_code = self.process.wait()
+                if self.output_queue:
+                    self.output_queue.put(("exit", exit_code))
+            except Exception as exc:
+                if self.output_queue:
+                    self.output_queue.put(("error", str(exc)))
+                logger.exception("Process worker failed")
+            finally:
+                self.process_active = False
+                if self.output_queue:
+                    self.output_queue.put(("sentinel", None))
+                if self.process and self.process.stdout:
+                    try:
+                        self.process.stdout.close()
+                    except Exception:
+                        pass
+                self.process = None
 
-            except (OSError, subprocess.SubprocessError) as e:
-                logger.error(f"Failed to start subprocess: {e}")
-                self.append_output(
-                    f"Error: Failed to start process: {e}\n", tag="error"
-                )
-                return
+        self.process_thread = threading.Thread(
+            target=worker, name="FlacrProcessWorker", daemon=True
+        )
+        self.process_thread.start()
+        self._schedule_queue_poll()
 
-            # Start output reading thread
-            logger.info("Starting output reader thread")
-            output_thread = threading.Thread(
-                target=self._read_process_output, daemon=True, name="OutputReaderThread"
-            )
-            output_thread.start()
+    def _schedule_queue_poll(self) -> None:
+        if self._queue_poll_job is None:
+            self._queue_poll_job = self.after(150, self._queue_poll)
 
-            # Process output with improved error handling
-            logger.info("Starting output processing loop")
-            self._process_output_loop()
+    def _queue_poll(self) -> None:
+        self._queue_poll_job = None
+        if not self.output_queue:
+            return
 
-            # Wait for process completion
-            logger.info("Waiting for process completion")
-            self._wait_for_completion()
-
-        except Exception as e:
-            logger.error(f"Critical error in process thread: {e}")
-            logger.error(traceback.format_exc())
-            self.append_output(f"Critical error: {e}\n", tag="error")
-        finally:
-            logger.info("Cleaning up process")
-            self._cleanup_process()
-
-    def _wait_for_completion(self):
-        """Wait for process completion with proper error handling"""
-        try:
-            if self.process:
-                logger.info("Waiting for process completion")
-                
-                # Wait with timeout
-                try:
-                    exit_code = self.process.wait(timeout=30)
-                    logger.info(f"Process completed with exit code: {exit_code}")
-                    
-                except subprocess.TimeoutExpired:
-                    logger.warning("Process did not complete within timeout, terminating")
-                    self._terminate_process_safely()
-                    exit_code = -1
-                
-                # Handle completion status based on exit code
-                self._handle_process_completion(exit_code)
-                
-        except Exception as e:
-            logger.error(f"Error waiting for process completion: {e}")
-            self.append_output(f'Error during process completion: {e}\n', tag='error')
-
-    def _process_output_loop(self):
-        """Main output processing loop with improved timeout handling"""
-        total_files = None
-        processed = 0
-        current_file = ""
-        last_output_time = time.time()
-        last_progress_time = time.time()
-        last_gui_update = time.time()
-        current_operation = "Starting"
-
-        # Dynamic timeout settings
-        operation_timeouts = {
-            "scanning": 600,  # 10 minutes for scanning
-            "checking": 1800,  # 30 minutes for checking files
-            "encoding": 3600,  # 1 hour for encoding
-            "verifying": 1800,  # 30 minutes for verification
-            "rsgain": 7200,  # 2 hours for replay gain
-            "default": 600,  # 10 minutes default
-        }
-
-        consecutive_errors = 0
-        max_consecutive_errors = 5
-        gui_update_interval = 0.1  # Update GUI max every 100ms
-
-        while self.process_active:
+        while True:
             try:
-                # Check if process finished
-                if self.process and self.process.poll() is not None:
-                    logger.info("Process completed, stopping output loop")
-                    self.process_active = False
-                    break
+                event, payload = self.output_queue.get_nowait()
+            except queue.Empty:
+                break
 
-                # Get output with timeout - process multiple lines if available
-                lines_to_process = []
-                try:
-                    # Get first line with timeout
-                    line = self.output_queue.get(timeout=0.5)
-                    if line is None:  # End of output signal
-                        break
-                    lines_to_process.append(line)
-                    
-                    # Get additional lines without blocking (batch processing)
-                    while len(lines_to_process) < 50:  # Limit batch size
-                        try:
-                            line = self.output_queue.get_nowait()
-                            if line is None:  # End of output signal
-                                break
-                            lines_to_process.append(line)
-                        except queue.Empty:
-                            break
+            if event == "line":
+                self._handle_process_output_line(str(payload))
+            elif event == "error":
+                self.append_output(f"Error: {payload}\n", tag="error")
+            elif event == "exit":
+                self._exit_code = int(payload) if payload is not None else None
+            elif event == "sentinel":
+                # Sentinel consumed later when queue fully drained
+                pass
 
-                    # Emergency queue drain if it's getting too full
-                    if self.output_queue.qsize() > 4000:  # 80% of max capacity
-                        logger.warning(f"Queue very full ({self.output_queue.qsize()}), draining excess")
-                        drained = 0
-                        while self.output_queue.qsize() > 2000 and drained < 1000:
-                            try:
-                                self.output_queue.get_nowait()
-                                drained += 1
-                            except queue.Empty:
-                                break
-                        logger.warning(f"Drained {drained} excess queue items")
-
-                    consecutive_errors = 0  # Reset error counter on successful read
-                    current_time = time.time()
-                    last_output_time = current_time
-
-                    # Process all lines in batch
-                    for line in lines_to_process:
-                        if line is None:
-                            break
-                        result = self._process_output_line(
-                            line, current_time, last_progress_time
-                        )
-                        if result:
-                            operation, file_info, progress_info = result
-                            if operation:
-                                current_operation = operation
-                                last_progress_time = current_time
-                            if file_info:
-                                current_file, processed = file_info
-                                last_progress_time = current_time
-                            if progress_info:
-                                total_files = progress_info
-                    
-                    # Rate-limited GUI updates to prevent overwhelming tkinter
-                    if current_time - last_gui_update >= gui_update_interval:
-                        self.after_idle(lambda: None)  # Force GUI refresh
-                        last_gui_update = current_time
-
-                except queue.Empty:
-                    # Handle timeout conditions
-                    current_time = time.time()
-                    timeout_result = self._handle_timeout(
-                        current_time,
-                        last_output_time,
-                        last_progress_time,
-                        current_operation,
-                        current_file,
-                        operation_timeouts,
-                    )
-
-                    if timeout_result == "terminate":
-                        break
-                    elif timeout_result == "reset_progress":
-                        last_progress_time = current_time
-
-            except Exception as e:
-                consecutive_errors += 1
-                logger.error(
-                    f"Error in output loop (attempt {consecutive_errors}): {e}"
-                )
-
-                if consecutive_errors >= max_consecutive_errors:
-                    logger.error("Too many consecutive errors, terminating")
-                    self.append_output(
-                        f"Too many errors occurred, stopping process.\n", tag="error"
-                    )
-                    break
-
-                time.sleep(0.5)  # Brief pause before retry
-
-    def _process_output_line(self, line, current_time, last_progress_time):
-        """Process a single output line and extract information"""
-        try:
-            # Only append output for important lines, not every single line
-            # to prevent GUI update overload
-            important_line = self._is_important_output_line(line)
-            if important_line:
-                logger.debug(f"Processing important output line: {line.strip()}")
-                self.append_output(line)
-
-            # Detect current operation
-            operation = self._detect_current_operation(line)
-            if operation:
-                logger.debug(f"Detected operation: {operation}")
-
-            # Extract file information
-            file_info = None
-            file_data = self._extract_file_info(line)
-            if file_data:
-                file_path, operation_type = file_data
-                logger.debug(f"Extracted file info: {file_path}, {operation_type}")
-
-                # Update file processing count
-                if operation_type in ["processing", "encoding", "verifying"]:
-                    self.files_processed += 1
-
-                status_text = f"{operation_type.title()}: {Path(file_path).name}"
-                self.update_progress(
-                    self.files_processed,
-                    self.total_files or self.files_processed,
-                    file_path,
-                    status_text,
-                )
-                file_info = (file_path, self.files_processed)
-
-            # Extract total files count
-            progress_info = None
-            if self.total_files is None:
-                summary_match = re.search(r"(\d+) flac files", line)
-                if summary_match:
-                    self.total_files = int(summary_match.group(1))
-                    self.progress["maximum"] = self.total_files
+        if self.process_active or (self.process_thread and self.process_thread.is_alive()):
+            self._queue_poll_job = self.after(200, self._queue_poll)
+            if self.process_active and self._last_output_time:
+                idle_for = time.time() - self._last_output_time
+                if idle_for > 60:
                     self.progress_label.config(
-                        text=f"Found {self.total_files} FLAC files"
+                        text=f"Waiting... no new output for {int(idle_for)}s"
                     )
-                    progress_info = self.total_files
-                    logger.debug(f"Found total files: {self.total_files}")
+            return
 
-            # Handle rsgain output
-            if self._is_rsgain_output(line):
-                operation = "rsgain"
-                rsgain_status = self._parse_rsgain_output(line)
-                if rsgain_status:
-                    self.progress_label.config(text=f"Replay Gain: {rsgain_status}")
+        if self.output_queue.empty():
+            self._finalise_processing()
+        else:
+            self._queue_poll_job = self.after(200, self._queue_poll)
 
-            return operation, file_info, progress_info
+    def _handle_process_output_line(self, line: str) -> None:
+        self._last_output_time = time.time()
+        tag = self._categorise_tag(line)
+        self.append_output(line + "\n", tag=tag)
+        self._analyse_line_for_progress(line)
 
-        except Exception as e:
-            logger.error(f"Error processing output line: {e}")
-            return None
-
-    def _is_important_output_line(self, line):
-        """Determine if this output line should be shown in GUI to reduce spam"""
-        line_lower = line.lower().strip()
-        
-        # Always show these important line types
-        important_patterns = [
-            # Progress and status messages
-            r'scanning|found \d+ flac files|processing|completed',
-            # File operations
-            r'encoding|verifying|checking|transcoding',
-            # Errors and warnings
-            r'error|warning|failed|problem',
-            # Summary information
-            r'total|summary|finished|done',
-            # Replay gain operations
-            r'rsgain|replay gain|calculating gain',
-            # Important file mentions (not every progress line)
-            r'\.flac.*->.*\.flac',
-        ]
-        
-        # Skip verbose progress indicators and repeated messages
-        skip_patterns = [
-            r'^\s*\d+%\s*$',  # Just percentage numbers
-            r'^\s*\|\s*[▉▊▋▌▍▎▏\s]*\|\s*\d+%',  # Progress bars
-            r'^\s*[\.]{3,}',  # Multiple dots
-            r'reading.*metadata',  # Verbose metadata reading
-        ]
-        
-        # Check if we should skip this line
-        for pattern in skip_patterns:
-            if re.search(pattern, line_lower):
-                return False
-        
-        # Check if this is an important line
-        for pattern in important_patterns:
-            if re.search(pattern, line_lower):
-                return True
-        
-        # For debugging, show some lines but not all
-        # Show every 50th line of unmatched content
-        import random
-        return random.randint(1, 50) == 1
-
-    def _handle_timeout(
-        self,
-        current_time,
-        last_output_time,
-        last_progress_time,
-        current_operation,
-        current_file,
-        operation_timeouts,
-    ):
-        """Handle timeout conditions with appropriate user feedback"""
-        try:
-            current_timeout = operation_timeouts.get(
-                current_operation.lower(), operation_timeouts["default"]
-            )
-            time_since_output = current_time - last_output_time
-            time_since_progress = current_time - last_progress_time
-
-            # Show what we're waiting for
-            if time_since_output > 30:  # After 30 seconds of no output
-                waiting_text = f"Waiting for {current_operation}"
-                if current_file:
-                    waiting_text += f" on {Path(current_file).name}"
-
-                elapsed = time.time() - self.start_time if self.start_time else 0
-                waiting_text += (
-                    f" ({int(time_since_output)}s, total: {int(elapsed//60)}m)"
-                )
-                self.progress_label.config(text=waiting_text)
-
-            # Check for timeout
-            if time_since_output > current_timeout:
-                logger.warning(
-                    f"Timeout after {current_timeout}s during {current_operation}"
-                )
-                self.append_output(
-                    f"\n[TIMEOUT] No output for {current_timeout//60} minutes during {current_operation}.\n",
-                    tag="error",
-                )
-                if current_file:
-                    self.append_output(
-                        f"[TIMEOUT] Last file: {Path(current_file).name}\n", tag="error"
-                    )
-                self._terminate_process_safely()
-                return "terminate"
-
-            # Progress timeout warning
-            if time_since_progress > current_timeout * 2:
-                logger.warning(
-                    f"No progress for {current_timeout*2}s on {current_operation}"
-                )
-                self.append_output(
-                    f"\n[WARNING] No progress for {(current_timeout*2)//60} minutes on {current_operation}\n",
-                    tag="warn",
-                )
-                if current_file:
-                    self.append_output(
-                        f"[WARNING] Current file: {Path(current_file).name}\n",
-                        tag="warn",
-                    )
-                return "reset_progress"
-
-            # Keep GUI responsive
-            self.update_idletasks()
-            return "continue"
-
-        except Exception as e:
-            logger.error(f"Error in timeout handling: {e}")
-            return "continue"
-
-    def _read_process_output(self):
-        """Read process output and put it in queue with error handling"""
-        try:
-            logger.info("Starting output reader thread")
-
-            if not self.process or not self.process.stdout:
-                logger.error("No process or stdout available")
-                return
-
-            buffer_size = 8192  # Larger buffer for efficiency
-            partial_line = ""
-            lines_read = 0
-            dropped_lines = 0  # Track dropped lines to reduce log spam
-
-            try:
-                for line in iter(self.process.stdout.readline, ""):
-                    if not self.process_active:
-                        logger.info(f"Process no longer active, stopping output reader after {lines_read} lines")
-                        break
-
-                    try:
-                        lines_read += 1
-                        # Reduce debug logging frequency to prevent spam
-                        if lines_read % 100 == 0:
-                            logger.debug(f"Read {lines_read} lines so far")
-                        
-                        # Handle partial lines properly
-                        if line.endswith("\n"):
-                            full_line = partial_line + line
-                            partial_line = ""
-
-                            # Put line in queue with size check - batch processing approach
-                            try:
-                                self.output_queue.put_nowait(full_line)
-                                # Only log every 100th successful line to reduce spam
-                                if lines_read % 100 == 0:
-                                    logger.debug(f"Put line {lines_read} in queue")
-                            except queue.Full:
-                                # Drop line silently when queue is full to prevent log spam
-                                # Only log every 100th dropped line
-                                dropped_lines += 1
-                                if dropped_lines % 100 == 0:
-                                    logger.warning(f"Output queue full, dropped {dropped_lines} lines")
-                        else:
-                            partial_line += line
-
-                    except Exception as e:
-                        logger.error(f"Error processing output line {lines_read}: {e}")
-
-                # Handle any remaining partial line
-                if partial_line:
-                    try:
-                        self.output_queue.put_nowait(partial_line + "\n")
-                        logger.debug(f"Put final partial line in queue")
-                    except queue.Full:
-                        logger.warning("Queue full, dropped final partial line")
-
-                logger.info(f"Finished reading process output. Total lines read: {lines_read}")
-
-            except Exception as e:
-                logger.error(f"Error reading process output: {e}")
-
-        except Exception as e:
-            logger.error(f"Critical error in output reader: {e}")
-        finally:
-            try:
-                self.output_queue.put(None)  # Signal end of output
-                logger.info("Output reader thread finished")
-            except:
-                pass
-        """Read process output in a separate thread to prevent blocking - using best practices"""
-        try:
-            if not self.process or not self.process.stdout:
-                return
-
-            # Use proper file handling with context management principles
-            stdout = self.process.stdout
-
-            while self.process_active and self.process.poll() is None:
-                try:
-                    # Read line with proper error handling
-                    line = stdout.readline()
-
-                    if line:
-                        # Ensure we have clean text
-                        line = line.rstrip("\r\n") + "\n"
-                        self.output_queue.put(line)
-                    else:
-                        # Check if process is still running
-                        if self.process.poll() is not None:
-                            break
-                        # Brief pause to prevent busy waiting
-                        time.sleep(0.01)
-
-                except (ValueError, OSError) as e:
-                    # Handle pipe closure or other I/O errors
-                    self.output_queue.put(f"Process communication error: {e}\n")
-                    break
-                except Exception as e:
-                    self.output_queue.put(f"Unexpected output reading error: {e}\n")
-                    break
-
-            # Read any remaining output using best practices
-            try:
-                # Set stdout to non-blocking if possible (Unix only)
-                if (
-                    HAS_FCNTL
-                    and hasattr(os, "O_NONBLOCK")
-                    and hasattr(stdout, "fileno")
-                ):
-                    try:
-                        fd = stdout.fileno()
-                        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-                        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-                    except (OSError, AttributeError):
-                        pass  # Not available or accessible
-
-                # Read remaining output with timeout
-                remaining_lines = []
-                timeout_start = time.time()
-
-                while time.time() - timeout_start < 2.0:  # 2 second timeout
-                    try:
-                        line = stdout.readline()
-                        if line:
-                            remaining_lines.append(line.rstrip("\r\n") + "\n")
-                        else:
-                            break
-                    except (ValueError, OSError):
-                        break
-
-                # Add remaining lines to queue
-                for line in remaining_lines:
-                    self.output_queue.put(line)
-
-            except Exception as e:
-                # Don't add error for remaining output - it's expected during termination
-                pass
-
-            # Signal end of output
-            self.output_queue.put(None)
-
-        except Exception as e:
-            self.output_queue.put(f"Critical output thread error: {e}\n")
-            self.output_queue.put(None)
-        finally:
-            # Ensure stdout is properly handled
-            try:
-                if (
-                    self.process
-                    and self.process.stdout
-                    and not self.process.stdout.closed
-                ):
-                    # Don't close stdout here - let subprocess handle it
-                    pass
-            except Exception:
-                pass
-
-    def _detect_current_operation(self, line):
-        """Detect what operation is currently being performed"""
-        line_lower = line.lower()
-
-        if "scanning" in line_lower or "searching" in line_lower:
-            return "scanning"
-        elif "checking" in line_lower and (
-            "files" in line_lower or "metadata" in line_lower
-        ):
-            return "checking"
-        elif "encoding" in line_lower or "recompress" in line_lower:
-            return "encoding"
-        elif "verifying" in line_lower or "testing" in line_lower:
-            return "verifying"
-        elif "rsgain" in line_lower or "replay gain" in line_lower:
-            return "rsgain"
-        elif "calculating" in line_lower:
-            return "rsgain"
-
+    def _categorise_tag(self, line: str) -> Optional[str]:
+        lower = line.lower()
+        if any(keyword in lower for keyword in ["error", "failed", "traceback"]):
+            return "error"
+        if any(keyword in lower for keyword in ["warning", "skipping", "retry"]):
+            return "warn"
+        if any(keyword in lower for keyword in ["success", "completed", "done"]):
+            return "success"
         return None
 
-    def _extract_file_info(self, line):
-        """Extract file information and operation type from output line"""
+    def _analyse_line_for_progress(self, line: str) -> None:
+        total_match = re.search(r"found\s+(\d+)\s+flac", line, re.IGNORECASE)
+        if total_match:
+            self.total_files = int(total_match.group(1))
+            self.progress.configure(maximum=max(1, self.total_files))
+            self.progress_label.config(text=f"Found {self.total_files} FLAC file(s)")
+
+        file_info = self._extract_file_info(line)
+        if not file_info:
+            return
+
+        file_path, operation = file_info
+        status_text = f"{operation.title()}: {file_path.name}"
+
+        if operation in {"processing", "encoding", "verifying", "completed", "checking"}:
+            if file_path.as_posix() not in self._seen_files:
+                self._seen_files.add(file_path.as_posix())
+                self.files_processed += 1
+
+        total = self.total_files or max(1, self.files_processed)
+        self.update_progress(self.files_processed, total, file_path, status_text)
+
+    def _extract_file_info(self, line: str) -> Optional[Tuple[Path, str]]:
         patterns = [
-            # Core processing patterns
             (r"Processing:\s*(.+\.flac)", "processing"),
-            (r"Verifying:\s*(.+\.flac)", "verifying"),
             (r"Encoding:\s*(.+\.flac)", "encoding"),
+            (r"Verifying:\s*(.+\.flac)", "verifying"),
             (r"Checking:\s*(.+\.flac)", "checking"),
             (r"Successfully processed:\s*(.+\.flac)", "completed"),
-            # File status patterns
-            (r"Will re-encode:\s*(.+\.flac)", "queued"),
-            (r"Skipping (.+\.flac):", "skipped"),
-            (r"(.+\.flac): already encoded", "skipped"),
-            # Error patterns
-            (r"Error processing (.+\.flac):", "error"),
-            (r"Verification error for (.+\.flac):", "error"),
-            # Generic file mention
-            (r'([^\\/:*?"<>|\s]+\.flac)', "mentioned"),
+            (r"Skipping\s+(.+\.flac)", "skipped"),
+            (r"Error processing\s+(.+\.flac)", "error"),
         ]
-
-        for pattern, operation_type in patterns:
+        for pattern, label in patterns:
             match = re.search(pattern, line, re.IGNORECASE)
             if match:
-                file_path = match.group(1).strip()
-                # Clean up path - remove quotes and extra spaces
-                file_path = file_path.strip("\"'")
-                return file_path, operation_type
-
+                raw_path = match.group(1).strip().strip('"')
+                return Path(raw_path), label
         return None
 
-    def _is_rsgain_output(self, line):
-        """Check if line is rsgain output"""
-        rsgain_indicators = [
-            "rsgain",
-            "replay gain",
-            "loudness",
-            "lufs",
-            "peak",
-            "scanning",
-            "album gain",
-            "track gain",
-        ]
-        line_lower = line.lower()
-        return any(indicator in line_lower for indicator in rsgain_indicators)
+    def update_progress(
+        self,
+        processed: int,
+        total: int,
+        current_file: Optional[Path] = None,
+        status_text: Optional[str] = None,
+    ) -> None:
+        total = max(1, total)
+        processed = max(0, min(processed, total))
+        self.progress.configure(maximum=total, value=processed)
 
-    def _parse_rsgain_output(self, line):
-        """Parse rsgain output for status information"""
-        line_lower = line.lower()
+        if status_text:
+            label = status_text
+        elif current_file:
+            label = f"Processing {current_file.name} ({processed}/{total})"
+        else:
+            label = f"Progress: {processed}/{total}"
 
-        # Look for progress indicators
-        if "scanning" in line_lower:
-            # Extract file being scanned
-            file_match = re.search(r'([^\\/:*?"<>|\s]+\.flac)', line, re.IGNORECASE)
-            if file_match:
-                return f"Scanning {os.path.basename(file_match.group(1))}"
-            return "Scanning files..."
+        pct = processed / total * 100
+        label = f"{label} - {pct:.1f}%"
+        self.progress_label.config(text=label)
+        self._update_window_title(pct)
 
-        elif "writing" in line_lower or "updating" in line_lower:
-            return "Writing replay gain tags..."
+    def _update_window_title(self, percentage: float) -> None:
+        clamped = max(0.0, min(percentage, 100.0))
+        self.title(f"FLACR GUI - {clamped:.0f}% complete")
 
-        elif "album" in line_lower and "gain" in line_lower:
-            return "Calculating album gain..."
+    def append_output(self, text: str, tag: Optional[str] = None) -> None:
+        self.after_idle(self._append_output_safe, text, tag)
 
-        elif "track" in line_lower and "gain" in line_lower:
-            return "Calculating track gain..."
+    def _append_output_safe(self, text: str, tag: Optional[str] = None) -> None:
+        if not self.output_text.winfo_exists():
+            return
 
-        elif "complete" in line_lower or "done" in line_lower:
-            return "Replay gain calculation complete"
+        self.output_text.config(state="normal")
+        self._ensure_log_size()
+        self.output_text.insert(tk.END, text, tag)
+        self.output_text.see(tk.END)
+        self.output_text.config(state="disabled")
 
-        # Look for progress numbers
-        progress_match = re.search(r"(\d+)/(\d+)", line)
-        if progress_match:
-            current, total = progress_match.groups()
-            return f"Progress: {current}/{total}"
+    def _ensure_log_size(self) -> None:
+        current_lines = int(float(self.output_text.index("end-1c").split(".")[0]))
+        if current_lines <= self.max_log_lines:
+            return
+        excess = current_lines - self.max_log_lines
+        self.output_text.delete("1.0", f"{excess + 1}.0")
 
-        return None
+    def _start_runtime_timer(self) -> None:
+        self._stop_runtime_timer()
+        self._runtime_job = self.after(1000, self._update_runtime_label)
 
-    def _terminate_process_safely(self):
-        """Safely terminate the process with comprehensive cleanup"""
-        try:
-            logger.info("Safely terminating process")
+    def _update_runtime_label(self) -> None:
+        if self.process_active and self.start_time:
+            elapsed = int(time.time() - self.start_time)
+            self.runtime_var.set(f"Elapsed: {format_duration(elapsed)}")
+            self._runtime_job = self.after(1000, self._update_runtime_label)
+        else:
+            self.runtime_var.set("Idle")
+            self._runtime_job = None
 
-            if hasattr(self, "process") and self.process:
-                # Try graceful termination first
-                try:
-                    if self.process.poll() is None:  # Process is still running
-                        logger.info("Sending SIGTERM to process")
-                        self.process.terminate()
-
-                        # Wait briefly for graceful shutdown
-                        try:
-                            self.process.wait(timeout=5)
-                            logger.info("Process terminated gracefully")
-                        except subprocess.TimeoutExpired:
-                            logger.warning(
-                                "Process did not terminate gracefully, forcing kill"
-                            )
-                            self.process.kill()
-                            try:
-                                self.process.wait(timeout=5)
-                                logger.info("Process killed successfully")
-                            except subprocess.TimeoutExpired:
-                                logger.error("Failed to kill process")
-
-                except Exception as e:
-                    logger.error(f"Error during process termination: {e}")
-
-            # Signal end of processing
-            self.process_active = False
-            if hasattr(self, "output_queue"):
-                try:
-                    self.output_queue.put(None)  # Signal end
-                except:
-                    pass
-
-        except Exception as e:
-            logger.error(f"Error in safe termination: {e}")
-
-    def _read_remaining_output(self):
-        """Read any remaining output from the process - handled by queue system"""
-        # With the queue-based approach, this is handled by the output thread
-        pass
-
-    def _handle_process_completion(self, exit_code):
-        """Handle process completion with appropriate user feedback"""
-        try:
-            elapsed = time.time() - self.start_time if self.start_time else 0
-            elapsed_str = f"{int(elapsed//60)}m {int(elapsed%60)}s"
-
-            if exit_code == 0:
-                self.append_output(
-                    f"\n[COMPLETED] Process finished successfully in {elapsed_str}\n",
-                    tag="success",
-                )
-                self.progress_label.config(
-                    text=f"Completed successfully ({elapsed_str})"
-                )
-
-                # Final progress update
-                if self.total_files and self.files_processed:
-                    self.update_progress(
-                        self.total_files, self.total_files, "", "Complete"
-                    )
-
-            elif exit_code is None or exit_code < 0:
-                self.append_output(
-                    f"\n[CANCELLED] Process was cancelled after {elapsed_str}\n",
-                    tag="warn",
-                )
-                self.progress_label.config(text=f"Cancelled ({elapsed_str})")
-
-            else:
-                self.append_output(
-                    f"\n[ERROR] Process failed with exit code {exit_code} after {elapsed_str}\n",
-                    tag="error",
-                )
-                self.progress_label.config(text=f"Failed (exit code: {exit_code})")
-
-            # Log completion stats
-            logger.info(
-                f"Process completed: exit_code={exit_code}, files_processed={self.files_processed}, elapsed={elapsed_str}"
-            )
-
-        except Exception as e:
-            logger.error(f"Error handling process completion: {e}")
-            self.progress_label.config(text="Completed with errors")
-
-    def append_output(self, text, tag=None):
-        """Schedule GUI update in main thread to prevent memory corruption"""
-        try:
-            # Use after_idle for better GUI responsiveness
-            # Since FlacrGUI inherits from tk.Tk, self is the root window
-            self.after_idle(self._append_output_safe, text, tag)
-        except Exception as e:
-            logger.error(f"Error scheduling output update: {e}")
-            # Fallback to direct print
-            print(f"Output: {text.strip()}")
-
-    def _append_output_safe(self, text, tag=None):
-        """Safely append text to output widget with comprehensive error handling"""
-        try:
-            if not self.output_text or not self.output_text.winfo_exists():
-                logger.warning("Output text widget not available")
-                return
-
-            self.output_text.config(state="normal")
-
-            # Auto-truncate log if it gets too long to prevent memory issues
+    def _stop_runtime_timer(self) -> None:
+        if self._runtime_job is not None:
             try:
-                current_lines = int(self.output_text.index("end-1c").split(".")[0])
-                if current_lines > self.max_log_lines:
-                    # Remove first chunk of lines to prevent constant truncation
-                    lines_to_remove = min(500, current_lines - self.max_log_lines + 200)
-                    self.output_text.delete("1.0", f"{lines_to_remove}.0")
-
-                    # Add truncation notice
-                    timestamp = time.strftime("%H:%M:%S")
-                    truncation_msg = f"[{timestamp}] ... earlier output truncated ({lines_to_remove} lines) ...\n"
-                    self.output_text.insert("1.0", truncation_msg, "warn")
-
-            except Exception as e:
-                logger.error(f"Error during log truncation: {e}")
-
-            # Enhanced automatic tag detection
-            if tag is None:
-                text_lower = text.lower()
-                if any(
-                    keyword in text_lower
-                    for keyword in [
-                        "error",
-                        "failed",
-                        "exception",
-                        "critical",
-                        "traceback",
-                    ]
-                ):
-                    tag = "error"
-                elif any(
-                    keyword in text_lower
-                    for keyword in ["warning", "warn", "skipping", "cannot", "missing"]
-                ):
-                    tag = "warn"
-                elif any(
-                    keyword in text_lower
-                    for keyword in ["completed", "success", "done", "finished"]
-                ):
-                    tag = "success"
-                elif text.startswith("[") and "]" in text:
-                    # Status messages in brackets
-                    tag = "info"
-                elif "SKIPPED_FLAC:" in text:
-                    tag = "skipped"
-
-            # Insert text with proper tag
-            try:
-                self.output_text.insert(tk.END, text, tag)
-                self.output_text.see(tk.END)
-
-                # Periodically update display
-                if hasattr(self, "_last_display_update"):
-                    if (
-                        time.time() - self._last_display_update > 0.1
-                    ):  # Update every 100ms max
-                        self.output_text.update_idletasks()
-                        self._last_display_update = time.time()
-                else:
-                    self._last_display_update = time.time()
-
-            except Exception as e:
-                logger.error(f"Error inserting text to output widget: {e}")
-
-        except Exception as e:
-            logger.error(f"Critical error in output append: {e}")
-            # Emergency fallback
-            try:
-                print(f"GUI Error - Output: {text.strip()}")
-            except:
+                self.after_cancel(self._runtime_job)
+            except Exception:
                 pass
-        finally:
-            try:
-                if self.output_text and self.output_text.winfo_exists():
-                    self.output_text.config(state="disabled")
-            except:
-                pass
+            self._runtime_job = None
 
-    def update_progress(self, value, maximum, current_file=None, status_text=None):
-        """Schedule progress update in main thread with error handling and throttling"""
+    def cancel_flacr(self) -> None:
+        if not self.process_active:
+            return
+        self._cancel_requested = True
+        self.append_output("\nCancellation requested by user.\n", tag="warn")
+        self.progress_label.config(text="Cancelling...")
+        self._terminate_process()
+
+    def _terminate_process(self) -> None:
+        if not self.process or self.process.poll() is not None:
+            return
         try:
-            # Throttle progress updates to prevent GUI overload
-            current_time = time.time()
-            if hasattr(self, '_last_progress_update'):
-                if current_time - self._last_progress_update < 0.2:  # Max 5 updates per second
-                    return
-            self._last_progress_update = current_time
-            
-            self.after_idle(
-                self._update_progress_safe, value, maximum, current_file, status_text
+            self.process.terminate()
+            wait_until = time.time() + 5
+            while time.time() < wait_until and self.process.poll() is None:
+                time.sleep(0.1)
+            if self.process.poll() is None:
+                self.process.kill()
+        except Exception:
+            logger.exception("Unable to terminate process")
+
+    def _finalise_processing(self) -> None:
+        self.process_active = False
+        self._stop_runtime_timer()
+        self._set_buttons_idle()
+        elapsed = (
+            format_duration(int(time.time() - self.start_time)) if self.start_time else "0s"
+        )
+        self.runtime_var.set(f"Elapsed: {elapsed}")
+
+        if self._cancel_requested:
+            message = f"Processing cancelled after {elapsed}. Processed {self.files_processed} file(s)."
+            self.append_output("\nProcessing cancelled by user.\n", tag="warn")
+            messagebox.showinfo("Cancelled", message)
+        elif self._exit_code in (0, None):
+            total = max(self.files_processed, self.total_files)
+            message = (
+                f"Processing completed successfully in {elapsed}. "
+                f"Processed {self.files_processed} of {total} file(s)."
             )
-        except Exception as e:
-            logger.error(f"Error scheduling progress update: {e}")
+            self.append_output("\nProcessing completed successfully.\n", tag="success")
+            messagebox.showinfo("Success", message)
+        else:
+            message = (
+                f"Processing failed with exit code {self._exit_code} after {elapsed}. "
+                "Review the log for details."
+            )
+            self.append_output(
+                f"\nProcessing failed with exit code {self._exit_code}.\n", tag="error"
+            )
+            messagebox.showerror("Error", message)
 
-    def _update_progress_safe(
-        self, value, maximum, current_file=None, status_text=None
-    ):
-        """Safely update progress display with comprehensive validation"""
-        try:
-            # Validate inputs
-            if value is None:
-                value = 0
-            if maximum is None or maximum <= 0:
-                maximum = max(1, value)
+        self._cleanup_after_run()
+        if self._pending_close:
+            self.after(150, self._close_window)
 
-            # Ensure value doesn't exceed maximum
-            value = min(value, maximum)
+    def _cleanup_after_run(self) -> None:
+        self.process_thread = None
+        self.process = None
+        self.output_queue = None
+        self._queue_poll_job = None
+        self.title("FLACR - FLAC Recompressor GUI")
+        self.progress_label.config(text="Ready")
 
-            # Update progress bar
-            try:
-                if self.progress and self.progress.winfo_exists():
-                    self.progress["maximum"] = maximum
-                    self.progress["value"] = value
-            except Exception as e:
-                logger.error(f"Error updating progress bar: {e}")
+    def _set_buttons_running(self) -> None:
+        self.run_button.config(state="disabled")
+        self.cancel_button.config(state="normal")
 
-            # Update progress label
-            try:
-                if self.progress_label and self.progress_label.winfo_exists():
-                    if status_text:
-                        label_text = status_text
-                    else:
-                        percentage = (value / maximum * 100) if maximum > 0 else 0
-                        label_text = f"Progress: {value}/{maximum} ({percentage:.1f}%)"
+    def _set_buttons_idle(self) -> None:
+        self.run_button.config(state="normal")
+        self.cancel_button.config(state="disabled")
 
-                        if current_file:
-                            file_name = (
-                                Path(current_file).name
-                                if isinstance(current_file, (str, Path))
-                                else str(current_file)
-                            )
-                            if len(file_name) > 40:
-                                file_name = file_name[:37] + "..."
-                            label_text += f" - {file_name}"
-
-                    self.progress_label.config(text=label_text)
-
-            except Exception as e:
-                logger.error(f"Error updating progress label: {e}")            # Update window title with progress
-            try:
-                if maximum > 0 and value > 0:
-                    percentage = int(value / maximum * 100)
-                    title = f"FLACR GUI - {percentage}% Complete"
-                else:
-                    title = "FLACR GUI"
-                
-                if self and self.winfo_exists():
-                    self.title(title)
-                    
-            except Exception as e:
-                logger.error(f"Error updating window title: {e}")
-
-        except Exception as e:
-            logger.error(f"Critical error in progress update: {e}")
-
-    def _cleanup_process(self):
-        """Clean up process resources and reset GUI state"""
-        try:
-            logger.info("Cleaning up process resources")
-
-            # Clean up process
-            self.process_active = False
-            if hasattr(self, "process") and self.process:
-                try:
-                    if self.process.poll() is None:
-                        logger.info("Terminating remaining process")
-                        self.process.terminate()
-                        time.sleep(1)  # Give it time to terminate
-                        if self.process.poll() is None:
-                            logger.warning("Force killing process")
-                            self.process.kill()
-                except Exception as e:
-                    logger.error(f"Error during process cleanup: {e}")
-                finally:
-                    self.process = None
-
-            # Clean up queue
-            if hasattr(self, "output_queue"):
-                try:
-                    while not self.output_queue.empty():
-                        self.output_queue.get_nowait()
-                except:
-                    pass
-
-            # Reset GUI state
-            self.after(0, self._reset_gui_state)
-
-        except Exception as e:
-            logger.error(f"Error during cleanup: {e}")
-
-    def _reset_gui_state(self):
-        """Reset GUI state after process completion"""
-        try:
-            self.run_button.config(state="normal")
-            self.cancel_button.config(state="disabled")
-
-            # Reset window title
-            if self and self.winfo_exists():
-                self.title("FLACR GUI")
-
-            # Reset progress if no completion was detected
-            if not hasattr(self, "_completion_handled"):
-                if self.files_processed == 0:
-                    self.progress_label.config(text="Ready")
-                    self.progress["value"] = 0
-
-        except Exception as e:
-            logger.error(f"Error resetting GUI state: {e}")
-
-    def _update_progress_safe(
-        self, value, maximum, current_file=None, status_text=None
-    ):
-        try:
-            self.progress["maximum"] = maximum
-            self.progress["value"] = value
-
-            if status_text:
-                # Use provided status text
-                if maximum > 0:
-                    percentage = value / maximum * 100
-                    self.progress_label.config(
-                        text=f"{status_text} ({value}/{maximum} - {percentage:.1f}%)"
-                    )
-                else:
-                    self.progress_label.config(text=f"{status_text} ({value} files)")
-            elif current_file:
-                # Fallback to file-based status
-                display_file = os.path.basename(current_file)
-                percentage = (value / maximum * 100) if maximum > 0 else 0
-                self.progress_label.config(
-                    text=f"Processing: {display_file} ({value}/{maximum} - {percentage:.1f}%)"
-                )
-            elif maximum > 0:
-                # Generic progress
-                percentage = value / maximum * 100
-                self.progress_label.config(
-                    text=f"Progress: {value}/{maximum} files ({percentage:.1f}%)"
-                )
-            else:
-                # Unknown progress
-                self.progress_label.config(text=f"Processing... ({value} files)")
-        except Exception as e:
-            print(f"Progress update error: {e}")
-
-    def check_dependencies(self):
+    def check_dependencies(self, options: ProcessingOptions) -> bool:
         missing = []
-        if not shutil.which("flac"):
-            missing.append("flac")
-        if not shutil.which("metaflac"):
-            missing.append("metaflac")
-        if self.r_var.get() and not shutil.which("rsgain"):
+        for tool in ("flac", "metaflac"):
+            if shutil.which(tool) is None:
+                missing.append(tool)
+        if options.requires_rsgain and shutil.which("rsgain") is None:
             missing.append("rsgain")
+
         if missing:
             messagebox.showerror(
                 "Missing Dependencies",
-                f'The following tools are missing: {", ".join(missing)}.\nPlease install them and try again.',
+                "The following tools are required but not available: "
+                + ", ".join(missing),
             )
             return False
         return True
 
-    def open_error_log(self):
-        if not os.path.exists(ERROR_LOG_PATH):
+    def flac_supports_threads(self) -> bool:
+        flac_path = shutil.which("flac")
+        if not flac_path:
+            return False
+        try:
+            result = subprocess.run(
+                [flac_path, "--version"], capture_output=True, text=True, timeout=5
+            )
+        except (subprocess.SubprocessError, OSError):
+            return False
+        output = result.stdout or result.stderr or ""
+        match = re.search(r"flac\s+(\d+)\.(\d+)\.(\d+)", output)
+        if not match:
+            return False
+        major, minor, patch = map(int, match.groups())
+        return (major, minor, patch) >= (1, 5, 0)
+
+    def tqdm_installed(self) -> bool:
+        if self._tqdm_available is not None:
+            return self._tqdm_available
+        try:
+            import importlib.util
+
+            spec = importlib.util.find_spec("tqdm")
+            if spec is not None:
+                self._tqdm_available = True
+                return True
+        except Exception:
+            logger.debug("tqdm detection via find_spec failed", exc_info=True)
+        try:
+            import tqdm  # type: ignore
+
+            self._tqdm_available = True
+            return True
+        except ModuleNotFoundError:
+            self._tqdm_available = False
+            return False
+        except Exception:
+            logger.debug("Unexpected error importing tqdm", exc_info=True)
+            self._tqdm_available = False
+            return False
+
+    def open_error_log(self) -> None:
+        if not ERROR_LOG_PATH.exists():
             messagebox.showinfo("Error Log", "No error log found.")
             return
-        log_win = tk.Toplevel(self)
-        log_win.title("flacr_error.log")
-        log_win.geometry("700x400")
-        text = tk.Text(log_win, wrap="word")
-        text.pack(expand=True, fill="both")
-        with open(ERROR_LOG_PATH, encoding="utf8") as f:
-            log_content = f.read()
-        text.insert("1.0", log_content)
-        text.config(state="disabled")
+        log_window = tk.Toplevel(self)
+        log_window.title("flacr_error.log")
+        log_window.geometry("700x420")
+        text_widget = tk.Text(log_window, wrap="word")
+        text_widget.pack(expand=True, fill="both")
+        try:
+            content = ERROR_LOG_PATH.read_text(encoding="utf-8")
+        except OSError as exc:
+            content = f"Unable to read log file: {exc}"
+        text_widget.insert("1.0", content)
+        text_widget.config(state="disabled")
 
-    def show_help(self):
+    def show_help(self) -> None:
         help_text = (
             "flacr - FLAC Recompressor GUI\n\n"
-            "Options:\n"
-            "-d: Directory to scan for .flac files.\n"
-            "-j: flac >=1.5.0: Encode 1 file at a time with multi-threading (threadcount via -m) instead of encoding multiple files concurrently.\n"
-            "-l: Log errors to flacr.log.\n"
-            "-m: Number of threads for conversion and replay gain calculation.\n"
-            "-p: Show progress bars (requires tqdm).\n"
-            "-r: Calculate replay gain (requires rsgain).\n"
-            "-s: Only scan the current folder.\n"
-            "-t: Test only, skip recompression.\n"
-            "-Q: Quick mode: -r -p and -m with all available threads.\n"
-            "-S: Sequential mode: -j -r -p and -m 4.\n"
-            "-E: Check and fix ENCODER metadata tags.\n\n"
-            "Common examples:\n"
-            "Test flac files for errors (4 threads):\n"
-            "  flacr.py -t -m 4\n"
-            "Recompress flac files, no replay gain (4 threads):\n"
-            "  flacr.py -m 4\n"
-            "Recompress and calculate replay gain (all threads, progress):\n"
-            "  flacr.py -Q\n"
-            "Sequential mode (4 threads, progress):\n"
-            "  flacr.py -S\n"
-            "Check and fix ENCODER metadata:\n"
-            "  flacr.py -E\n"
-            "With directory:\n"
-            '  flacr.py -rlp -m 4 -d "D:/Test"\n\n'
-            "Documentation:\n"
-            "https://github.com/AverageHoarder/flacr\n"
-            "https://github.com/complexlogic/rsgain/releases\n"
-            "https://xiph.org/flac/download.html\n"
-            "https://github.com/tqdm/tqdm\n"
+            "-d  Directory to scan for .flac files\n"
+            "-j  Encode one file at a time with multi-threading (flac >= 1.5.0)\n"
+            "-l  Log errors to flacr.log\n"
+            "-m  Number of threads (conversion and replay gain)\n"
+            "-p  Show progress bars (requires tqdm)\n"
+            "-r  Calculate replay gain (requires rsgain)\n"
+            "-s  Only scan the current folder\n"
+            "-t  Test only, skip recompression\n"
+            "-Q  Quick mode (-r -p -m all available threads)\n"
+            "-S  Sequential mode (-j -r -p -m 4)\n"
+            "-E  Check and fix ENCODER metadata tags\n"
         )
         messagebox.showinfo("Help", help_text)
 
-    def copy_cli_command(self):
-        args = self.build_args()
-        # Remove sys.executable and script path for CLI copy
-        cli_args = args[2:] if args[0].endswith("python.exe") else args[1:]
-        cmd = f'python flacr.py {" ".join(map(str, cli_args))}'
+    def copy_cli_command(self) -> None:
+        options = ProcessingOptions.from_gui(self)
+        command = options.to_command()
+        if not command:
+            messagebox.showwarning("No Command", "Unable to build CLI command.")
+            return
+        try:
+            cmdline = subprocess.list2cmdline(command)
+        except Exception:
+            cmdline = " ".join(command)
         self.clipboard_clear()
-        self.clipboard_append(cmd)
-        messagebox.showinfo("CLI Command", f"Copied to clipboard:\n{cmd}")
+        self.clipboard_append(cmdline)
+        messagebox.showinfo("CLI Command", f"Copied to clipboard:\n{cmdline}")
 
-    def update_option_states(self):
-        # Quick mode: -Q sets -m to max, -r, -p, disables -S
+    def update_option_states(self) -> None:
         if self.Q_var.get():
             self.S_var.set(False)
             self.r_var.set(True)
             self.p_var.set(True)
-            self.m_var.set(os.cpu_count())
+            self.m_var.set(max(1, os.cpu_count() or 1))
             self.m_spin.config(state="disabled")
             self.r_check.config(state="disabled")
             self.p_check.config(state="disabled")
@@ -1800,30 +927,28 @@ class FlacrGUI(tk.Tk):
             self.p_check.config(state="normal")
             self.S_check.config(state="normal")
 
-        # Sequential mode: -S sets -m 4, -j, -r, -p, disables -Q
         if self.S_var.get():
             self.Q_var.set(False)
             self.r_var.set(True)
             self.p_var.set(True)
             self.j_var.set(True)
-            self.m_var.set(4 if os.cpu_count() >= 4 else os.cpu_count())
+            default_threads = 4 if (os.cpu_count() or 1) >= 4 else max(1, os.cpu_count() or 1)
+            self.m_var.set(default_threads)
             self.m_spin.config(state="disabled")
             self.r_check.config(state="disabled")
             self.p_check.config(state="disabled")
             self.j_check.config(state="disabled")
             self.Q_check.config(state="disabled")
         else:
+            self.j_check.config(state="normal")
+            self.Q_check.config(state="normal")
             if not self.Q_var.get():
                 self.m_spin.config(state="normal")
                 self.r_check.config(state="normal")
                 self.p_check.config(state="normal")
-            self.j_check.config(state="normal")
-            self.Q_check.config(state="normal")
 
-    def save_settings(self):
-        # Overwrite the config file from scratch to avoid any duplicate section or option errors
+    def save_settings(self) -> None:
         config = configparser.ConfigParser()
-        config.clear()  # Ensure config is empty
         config.add_section("main")
         config.set("main", "directory", self.dir_var.get())
         config.set("main", "j", str(self.j_var.get()))
@@ -1836,42 +961,64 @@ class FlacrGUI(tk.Tk):
         config.set("main", "Q", str(self.Q_var.get()))
         config.set("main", "S", str(self.S_var.get()))
         config.set("main", "E", str(self.E_var.get()))
-        with open(CONFIG_PATH, "w") as f:
-            config.write(f)
+        try:
+            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with CONFIG_PATH.open("w", encoding="utf-8") as handle:
+                config.write(handle)
+        except OSError:
+            logger.exception("Unable to save configuration")
 
-    def load_settings(self):
+    def _load_settings(self) -> None:
         config = configparser.ConfigParser()
-        if os.path.exists(CONFIG_PATH):
-            config.read(CONFIG_PATH)
-            if config.has_section("main"):
-                self.dir_var.set(config.get("main", "directory", fallback=os.getcwd()))
-                self.j_var.set(config.getboolean("main", "j", fallback=False))
-                self.l_var.set(config.getboolean("main", "l", fallback=False))
-                self.m_var.set(config.getint("main", "m", fallback=1))
-                self.p_var.set(config.getboolean("main", "p", fallback=False))
-                self.r_var.set(config.getboolean("main", "r", fallback=False))
-                self.s_var.set(config.getboolean("main", "s", fallback=False))
-                self.t_var.set(config.getboolean("main", "t", fallback=False))
-                self.Q_var.set(config.getboolean("main", "Q", fallback=False))
-                self.S_var.set(config.getboolean("main", "S", fallback=False))
-                self.E_var.set(config.getboolean("main", "E", fallback=False))
-                self.update_option_states()
+        if not CONFIG_PATH.exists():
+            return
+        try:
+            config.read(CONFIG_PATH, encoding="utf-8")
+        except (OSError, configparser.Error):
+            logger.warning("Unable to read configuration", exc_info=True)
+            return
+        if not config.has_section("main"):
+            return
+        section = config["main"]
+        self.dir_var.set(section.get("directory", self.dir_var.get()))
+        self.j_var.set(section.getboolean("j", fallback=False))
+        self.l_var.set(section.getboolean("l", fallback=False))
+        self.m_var.set(section.getint("m", fallback=max(1, os.cpu_count() or 1)))
+        self.p_var.set(section.getboolean("p", fallback=False))
+        self.r_var.set(section.getboolean("r", fallback=False))
+        self.s_var.set(section.getboolean("s", fallback=False))
+        self.t_var.set(section.getboolean("t", fallback=False))
+        self.Q_var.set(section.getboolean("Q", fallback=False))
+        self.S_var.set(section.getboolean("S", fallback=False))
+        self.E_var.set(section.getboolean("E", fallback=False))
+        self.update_option_states()
 
-    def on_close(self):
-        # Ensure any running process is properly terminated
-        if hasattr(self, "process") and self.process and self.process.poll() is None:
-            try:
-                self.process_active = False
-                self.process.terminate()
-                # Give it a moment to terminate
-                time.sleep(1)
-                if self.process.poll() is None:
-                    self.process.kill()
-            except Exception:
-                pass  # Ignore errors during cleanup
-
+    def on_close(self) -> None:
+        if self.process_active:
+            if not messagebox.askyesno(
+                "Process Running",
+                "A FLAC job is in progress. Cancel and exit?",
+                icon="warning",
+            ):
+                return
+            self._pending_close = True
+            self.cancel_flacr()
+            return
         self.save_settings()
+        self._close_window()
+
+    def _close_window(self) -> None:
+        self._cancel_after_jobs()
         self.destroy()
+
+    def _cancel_after_jobs(self) -> None:
+        if self._queue_poll_job is not None:
+            try:
+                self.after_cancel(self._queue_poll_job)
+            except Exception:
+                pass
+            self._queue_poll_job = None
+        self._stop_runtime_timer()
 
 
 if __name__ == "__main__":
