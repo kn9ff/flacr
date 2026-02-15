@@ -27,6 +27,33 @@ CONFIG_PATH = Path.home() / ".flacr_gui.ini"
 ERROR_LOG_PATH = Path(__file__).parent / "flacr_error.log"
 SCRIPT_PATH = Path(__file__).parent / "flacr.py"
 
+# Platform-specific subprocess kwargs to suppress console windows on Windows
+_SUBPROCESS_KWARGS: dict = {}
+if os.name == "nt":
+    _SUBPROCESS_KWARGS["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+
+def enable_dpi_awareness() -> None:
+    """Enable per-monitor DPI awareness on Windows for crisp rendering on high-DPI displays."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        # PROCESS_PER_MONITOR_DPI_AWARE_V2 for Windows 10 1703+ / Windows 11
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # type: ignore[attr-defined]
+    except (AttributeError, OSError):
+        try:
+            import ctypes
+
+            ctypes.windll.user32.SetProcessDPIAware()  # type: ignore[attr-defined]
+        except (AttributeError, OSError):
+            pass
+    except Exception:
+        logging.getLogger("flacr_gui").debug(
+            "Unable to set DPI awareness", exc_info=True
+        )
+
 
 def ensure_app_user_model_id() -> None:
     if os.name != "nt":
@@ -70,6 +97,7 @@ def setup_logging() -> logging.Logger:
 
 
 logger = setup_logging()
+enable_dpi_awareness()
 ensure_app_user_model_id()
 
 
@@ -189,11 +217,26 @@ class FlacrGUI(tk.Tk):
 
         self._setup_window()
         self._create_widgets()
+        self._bind_shortcuts()
         self._load_settings()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(200, self._validate_environment)
 
     def _setup_window(self) -> None:
+        # Configure ttk theme for native Windows 11 appearance
+        style = ttk.Style(self)
+        if os.name == "nt":
+            for theme in ("vista", "winnative"):
+                if theme in style.theme_names():
+                    style.theme_use(theme)
+                    break
+
+        # Set Segoe UI as default font for Windows 11 consistency
+        default_font = ("Segoe UI", 9)
+        style.configure(".", font=default_font)
+        style.configure("TLabelframe.Label", font=("Segoe UI", 9, "bold"))
+        style.configure("Status.TLabel", relief="sunken", padding=(6, 2))
+
         icon_candidates = [
             Path(__file__).parent / "flaccheck.ico",
             Path(__file__).parent / "icon.ico",
@@ -224,25 +267,27 @@ class FlacrGUI(tk.Tk):
         self.grid_rowconfigure(4, weight=1)
 
     def _create_widgets(self) -> None:
-        dir_frame = tk.Frame(self)
+        # --- Directory selection ---
+        dir_frame = ttk.Frame(self)
         dir_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=(10, 0))
         dir_frame.grid_columnconfigure(1, weight=1)
 
-        tk.Label(dir_frame, text="Directory:").grid(row=0, column=0, sticky="w")
+        ttk.Label(dir_frame, text="Directory:").grid(row=0, column=0, sticky="w")
         self.dir_var = tk.StringVar(value=str(Path.cwd()))
-        self.dir_entry = tk.Entry(dir_frame, textvariable=self.dir_var, width=50)
+        self.dir_entry = ttk.Entry(dir_frame, textvariable=self.dir_var, width=50)
         self.dir_entry.grid(row=0, column=1, sticky="ew", padx=(5, 5))
-        tk.Button(dir_frame, text="Browse...", command=self.browse_dir).grid(
+        ttk.Button(dir_frame, text="Browse... (Ctrl+O)", command=self.browse_dir).grid(
             row=0, column=2, sticky="e"
         )
 
-        self.options_frame = tk.LabelFrame(self, text="Options")
+        # --- Options ---
+        self.options_frame = ttk.LabelFrame(self, text="Options")
         self.options_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=10)
         for col in range(4):
             self.options_frame.grid_columnconfigure(col, weight=1)
 
         self.j_var = tk.BooleanVar()
-        self.j_check = tk.Checkbutton(
+        self.j_check = ttk.Checkbutton(
             self.options_frame,
             text="Encode 1 file at a time with multi-threading (-j)",
             variable=self.j_var,
@@ -251,16 +296,16 @@ class FlacrGUI(tk.Tk):
         self.j_check.grid(row=0, column=0, sticky="w", padx=(5, 0), pady=2)
 
         self.l_var = tk.BooleanVar()
-        self.l_check = tk.Checkbutton(
+        self.l_check = ttk.Checkbutton(
             self.options_frame, text="Log errors to flacr.log (-l)", variable=self.l_var
         )
         self.l_check.grid(row=0, column=1, sticky="w", padx=(5, 0), pady=2)
 
         self.m_var = tk.IntVar(value=max(1, os.cpu_count() or 1))
-        tk.Label(self.options_frame, text="Thread count (-m):").grid(
+        ttk.Label(self.options_frame, text="Thread count (-m):").grid(
             row=1, column=0, sticky="w", padx=(5, 0)
         )
-        self.m_spin = tk.Spinbox(
+        self.m_spin = ttk.Spinbox(
             self.options_frame,
             from_=1,
             to=max(1, os.cpu_count() or 1),
@@ -270,31 +315,31 @@ class FlacrGUI(tk.Tk):
         self.m_spin.grid(row=1, column=1, sticky="w", padx=(5, 0), pady=2)
 
         self.p_var = tk.BooleanVar()
-        self.p_check = tk.Checkbutton(
+        self.p_check = ttk.Checkbutton(
             self.options_frame, text="Show progress bars (-p)", variable=self.p_var
         )
         self.p_check.grid(row=1, column=2, sticky="w", padx=(5, 0), pady=2)
 
         self.r_var = tk.BooleanVar()
-        self.r_check = tk.Checkbutton(
+        self.r_check = ttk.Checkbutton(
             self.options_frame, text="Calculate replay gain (-r)", variable=self.r_var
         )
         self.r_check.grid(row=2, column=0, sticky="w", padx=(5, 0), pady=2)
 
         self.s_var = tk.BooleanVar()
-        self.s_check = tk.Checkbutton(
+        self.s_check = ttk.Checkbutton(
             self.options_frame, text="Only scan current folder (-s)", variable=self.s_var
         )
         self.s_check.grid(row=2, column=1, sticky="w", padx=(5, 0), pady=2)
 
         self.t_var = tk.BooleanVar()
-        self.t_check = tk.Checkbutton(
+        self.t_check = ttk.Checkbutton(
             self.options_frame, text="Test only, skip recompression (-t)", variable=self.t_var
         )
         self.t_check.grid(row=2, column=2, sticky="w", padx=(5, 0), pady=2)
 
         self.Q_var = tk.BooleanVar()
-        self.Q_check = tk.Checkbutton(
+        self.Q_check = ttk.Checkbutton(
             self.options_frame,
             text="Quick mode (-Q)",
             variable=self.Q_var,
@@ -303,7 +348,7 @@ class FlacrGUI(tk.Tk):
         self.Q_check.grid(row=3, column=0, sticky="w", padx=(5, 0), pady=2)
 
         self.S_var = tk.BooleanVar()
-        self.S_check = tk.Checkbutton(
+        self.S_check = ttk.Checkbutton(
             self.options_frame,
             text="Sequential mode (-S)",
             variable=self.S_var,
@@ -312,20 +357,20 @@ class FlacrGUI(tk.Tk):
         self.S_check.grid(row=3, column=1, sticky="w", padx=(5, 0), pady=2)
 
         self.E_var = tk.BooleanVar()
-        self.E_check = tk.Checkbutton(
+        self.E_check = ttk.Checkbutton(
             self.options_frame, text="Check ENCODER metadata (-E)", variable=self.E_var
         )
         self.E_check.grid(row=3, column=2, sticky="w", padx=(5, 0), pady=2)
 
-        self.progress_frame = tk.Frame(self)
+        # --- Progress section ---
+        self.progress_frame = ttk.Frame(self)
         self.progress_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=5)
 
-        self.progress_label = tk.Label(
+        self.progress_label = ttk.Label(
             self.progress_frame,
             text="Ready",
             anchor="w",
-            relief="sunken",
-            padx=6,
+            style="Status.TLabel",
         )
         self.progress_label.pack(fill="x", side="top")
 
@@ -335,44 +380,72 @@ class FlacrGUI(tk.Tk):
         self.progress.pack(fill="x", side="top", pady=(4, 0))
 
         self.runtime_var = tk.StringVar(value="Idle")
-        self.runtime_label = tk.Label(
+        self.runtime_label = ttk.Label(
             self.progress_frame,
             textvariable=self.runtime_var,
             anchor="w",
-            padx=6,
+            padding=(6, 2),
         )
         self.runtime_label.pack(fill="x", side="top", pady=(4, 0))
 
-        btn_frame = tk.Frame(self)
+        # --- Action buttons ---
+        btn_frame = ttk.Frame(self)
         btn_frame.grid(row=3, column=0, sticky="ew", padx=10, pady=5)
         btn_frame.grid_columnconfigure(4, weight=1)
 
-        self.run_button = tk.Button(btn_frame, text="Run", command=self.run_flacr)
+        self.run_button = ttk.Button(btn_frame, text="Run (F5)", command=self.run_flacr)
         self.run_button.grid(row=0, column=0, padx=(0, 5), sticky="w")
 
-        self.cancel_button = tk.Button(
-            btn_frame, text="Cancel", state="disabled", command=self.cancel_flacr
+        self.cancel_button = ttk.Button(
+            btn_frame, text="Cancel (Esc)", state="disabled", command=self.cancel_flacr
         )
         self.cancel_button.grid(row=0, column=1, padx=(0, 5), sticky="w")
 
-        tk.Button(btn_frame, text="View Error Log", command=self.open_error_log).grid(
+        ttk.Button(btn_frame, text="View Error Log", command=self.open_error_log).grid(
             row=0, column=2, padx=(0, 5), sticky="w"
         )
-        tk.Button(btn_frame, text="Help", command=self.show_help).grid(
+        ttk.Button(btn_frame, text="Help", command=self.show_help).grid(
             row=0, column=3, padx=(0, 5), sticky="w"
         )
-        tk.Button(btn_frame, text="Copy CLI Command", command=self.copy_cli_command).grid(
+        ttk.Button(btn_frame, text="Copy CLI Command", command=self.copy_cli_command).grid(
             row=0, column=4, sticky="e"
         )
 
+        # --- Output log with scrollbar ---
+        output_frame = ttk.Frame(self)
+        output_frame.grid(row=4, column=0, padx=10, pady=(0, 10), sticky="nsew")
+        output_frame.grid_columnconfigure(0, weight=1)
+        output_frame.grid_rowconfigure(0, weight=1)
+
         self.output_text = tk.Text(
-            self, height=18, wrap="word", state="disabled", bg="#1e1e1e", fg="#dcdcdc"
+            output_frame, height=18, wrap="word", state="disabled",
+            bg="#1e1e1e", fg="#dcdcdc", insertbackground="#dcdcdc",
+            selectbackground="#264f78", selectforeground="#ffffff",
+            font=("Consolas", 9),
         )
-        self.output_text.grid(row=4, column=0, padx=10, pady=(0, 10), sticky="nsew")
+        self.output_text.grid(row=0, column=0, sticky="nsew")
+
+        output_scrollbar = ttk.Scrollbar(
+            output_frame, orient="vertical", command=self.output_text.yview
+        )
+        output_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.output_text.configure(yscrollcommand=output_scrollbar.set)
+
         self.output_text.tag_configure("error", foreground="#ff6666")
         self.output_text.tag_configure("warn", foreground="#ffcc66")
         self.output_text.tag_configure("success", foreground="#90ee90")
         self.output_text.tag_configure("info", foreground="#add8e6")
+
+    def _bind_shortcuts(self) -> None:
+        """Bind keyboard shortcuts for common actions."""
+        self.bind("<Control-o>", lambda e: self.browse_dir())
+        self.bind("<F5>", lambda e: self._on_run_shortcut())
+        self.bind("<Escape>", lambda e: self.cancel_flacr())
+
+    def _on_run_shortcut(self) -> None:
+        """Handle F5 keyboard shortcut - only run if not already processing."""
+        if not self.process_active:
+            self.run_flacr()
 
     def _validate_environment(self) -> None:
         logger.info("Validating environment")
@@ -404,6 +477,7 @@ class FlacrGUI(tk.Tk):
                     capture_output=True,
                     text=True,
                     timeout=10,
+                    **_SUBPROCESS_KWARGS,
                 )
                 if result.returncode == 0:
                     self.append_output("Syntax check: OK\n", tag="success")
@@ -828,7 +902,8 @@ class FlacrGUI(tk.Tk):
             return False
         try:
             result = subprocess.run(
-                [flac_path, "--version"], capture_output=True, text=True, timeout=5
+                [flac_path, "--version"], capture_output=True, text=True, timeout=5,
+                **_SUBPROCESS_KWARGS,
             )
         except (subprocess.SubprocessError, OSError):
             return False
@@ -871,8 +946,21 @@ class FlacrGUI(tk.Tk):
         log_window = tk.Toplevel(self)
         log_window.title("flacr_error.log")
         log_window.geometry("700x420")
-        text_widget = tk.Text(log_window, wrap="word")
-        text_widget.pack(expand=True, fill="both")
+
+        log_frame = ttk.Frame(log_window)
+        log_frame.pack(expand=True, fill="both")
+        log_frame.grid_columnconfigure(0, weight=1)
+        log_frame.grid_rowconfigure(0, weight=1)
+
+        text_widget = tk.Text(log_frame, wrap="word", font=("Consolas", 9))
+        text_widget.grid(row=0, column=0, sticky="nsew")
+
+        log_scrollbar = ttk.Scrollbar(
+            log_frame, orient="vertical", command=text_widget.yview
+        )
+        log_scrollbar.grid(row=0, column=1, sticky="ns")
+        text_widget.configure(yscrollcommand=log_scrollbar.set)
+
         try:
             content = ERROR_LOG_PATH.read_text(encoding="utf-8")
         except OSError as exc:
