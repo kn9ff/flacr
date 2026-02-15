@@ -6,6 +6,7 @@ import argparse
 import shutil
 import getpass
 import concurrent.futures
+from pathlib import Path
 from tqdm import tqdm
 from datetime import datetime
 import re
@@ -18,6 +19,11 @@ LOG_FILENAME = "flacr_error.log"
 MIN_FLAC_VERSION = (1, 5, 0)
 DEFAULT_PADDING = 4096
 MIN_RSGAIN_THREADS = 2
+
+# Platform-specific subprocess kwargs to suppress console windows on Windows
+_SUBPROCESS_PLATFORM_KWARGS: dict = {}
+if sys.platform == "win32":
+    _SUBPROCESS_PLATFORM_KWARGS["creationflags"] = subprocess.CREATE_NO_WINDOW
 
 
 def safe_print(text):
@@ -203,7 +209,7 @@ def find_flac_files(directory, single_folder, progress):
                     for file in files:
                         pbar.update(1)
                         if file.lower().endswith(FLAC_EXTENSION):
-                            full_path = os.path.join(os.path.abspath(root), file)
+                            full_path = str(Path(root).resolve() / file)
                             flac_files.append(full_path)
                             flac_count += 1
                             pbar.set_postfix({"flac files found": flac_count})
@@ -217,15 +223,13 @@ def find_flac_files(directory, single_folder, progress):
             ) as pbar:
                 flac_count = 0
                 try:
-                    files = os.listdir(directory)
-                    for file in files:
+                    dir_path = Path(directory).resolve()
+                    for entry in dir_path.iterdir():
                         pbar.update(1)
-                        if file.lower().endswith(FLAC_EXTENSION):
-                            file_path = os.path.join(os.path.abspath(directory), file)
-                            if os.path.isfile(file_path):  # Ensure it's actually a file
-                                flac_files.append(file_path)
-                                flac_count += 1
-                                pbar.set_postfix({"flac files found": flac_count})
+                        if entry.suffix.lower() == FLAC_EXTENSION and entry.is_file():
+                            flac_files.append(str(entry))
+                            flac_count += 1
+                            pbar.set_postfix({"flac files found": flac_count})
                 except OSError as e:
                     safe_print(f"Error listing directory contents: {e}")
                     return []
@@ -250,6 +254,7 @@ def verify_flac(file_path):
             text=True,
             check=True,
             timeout=600,  # 10 minute timeout for verification
+            **_SUBPROCESS_PLATFORM_KWARGS,
         )
         return file_path, result.stderr
     except subprocess.TimeoutExpired:
@@ -274,6 +279,7 @@ def get_system_flac_version():
             stderr=subprocess.PIPE,
             text=True,
             check=True,
+            **_SUBPROCESS_PLATFORM_KWARGS,
         )
         # Example output: "flac 1.5.0" or "flac 1.5.0 20250211"
         m = re.search(r"flac (\d+)\.(\d+)\.(\d+)", result.stdout)
@@ -295,6 +301,7 @@ def get_flac_encoder_string():
             stderr=subprocess.PIPE,
             text=True,
             check=True,
+            **_SUBPROCESS_PLATFORM_KWARGS,
         )
         # Example output: "flac 1.5.0" or "flac 1.5.0 20250211"
         # First try to match version with optional date
@@ -324,6 +331,7 @@ def get_file_flac_version(file_path):
             text=True,
             check=True,
             timeout=30,  # 30 second timeout for metadata reading
+            **_SUBPROCESS_PLATFORM_KWARGS,
         )
         # Example output: "reference libFLAC 1.4.2 20221022"
         match = re.search(r"libFLAC (\d+)\.(\d+)\.(\d+)", result.stdout)
@@ -350,6 +358,7 @@ def get_file_encoder_string(file_path):
             text=True,
             check=True,
             timeout=30,  # 30 second timeout for metadata reading
+            **_SUBPROCESS_PLATFORM_KWARGS,
         )
         return result.stdout.strip() if result.stdout.strip() else None
     except subprocess.TimeoutExpired:
@@ -370,6 +379,7 @@ def get_encoder_metadata_tags(file_path):
             stderr=subprocess.PIPE,
             text=True,
             check=True,
+            **_SUBPROCESS_PLATFORM_KWARGS,
         )
         # Output format: "ENCODER=reference libFLAC 1.5.0" (one per line if multiple)
         encoder_tags = []
@@ -434,6 +444,7 @@ def check_and_fix_encoder_metadata(file_path, fix_issues=True):
                     stderr=subprocess.PIPE,
                     text=True,
                     check=True,
+                    **_SUBPROCESS_PLATFORM_KWARGS,
                 )
 
             # Set the correct ENCODER tag based on vendor string
@@ -443,6 +454,7 @@ def check_and_fix_encoder_metadata(file_path, fix_issues=True):
                 stderr=subprocess.PIPE,
                 text=True,
                 check=True,
+                **_SUBPROCESS_PLATFORM_KWARGS,
             )
             fixed = True
         except Exception as e:
@@ -519,6 +531,7 @@ def reencode_flac(file_path, thread_count=1):
             text=True,
             check=True,
             timeout=3600,  # 1 hour timeout for safety
+            **_SUBPROCESS_PLATFORM_KWARGS,
         )
 
         if result.stderr:
@@ -545,8 +558,7 @@ def reencode_flac(file_path, thread_count=1):
                 # Create backup of original file permissions
                 original_stat = os.stat(file_path)
 
-                os.remove(file_path)
-                os.rename(temp_file_path, file_path)
+                os.replace(temp_file_path, file_path)
 
                 # Restore original permissions
                 os.chmod(file_path, original_stat.st_mode)
@@ -557,6 +569,7 @@ def reencode_flac(file_path, thread_count=1):
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
+                    **_SUBPROCESS_PLATFORM_KWARGS,
                 )
                 # Set ENCODER tag
                 encoder_str = get_flac_encoder_string()
@@ -565,6 +578,7 @@ def reencode_flac(file_path, thread_count=1):
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
+                    **_SUBPROCESS_PLATFORM_KWARGS,
                 )
             except PermissionError:
                 return (
@@ -632,6 +646,7 @@ def run_rsgain(directory, thread_count):
             text=True,
             bufsize=1,
             universal_newlines=True,
+            **_SUBPROCESS_PLATFORM_KWARGS,
         )
 
         # Read output line by line to provide feedback
@@ -767,7 +782,8 @@ def rsgain_on_path():
 def flac_version_check():
     min_version_pattern = r"^flac (?:(1\.(?:[5-9]|1[0-9])\.\d+)|((2\.\d+\.\d+)))$"
     flac_version = subprocess.run(
-        ["flac", "--version"], encoding="utf-8", stdout=subprocess.PIPE
+        ["flac", "--version"], encoding="utf-8", stdout=subprocess.PIPE,
+        **_SUBPROCESS_PLATFORM_KWARGS,
     )
     # Check if the flac version is >=1.5.0 as multi-threading is not available in earlier versions
     if re.match(min_version_pattern, flac_version.stdout):
@@ -1022,6 +1038,7 @@ def main(args):
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     args = parse_arguments()
     try:
         main(args)
